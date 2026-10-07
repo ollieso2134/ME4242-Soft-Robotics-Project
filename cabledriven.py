@@ -1,0 +1,328 @@
+"""
+cabledriven.py
+--------------
+Soft Robotics Cable-Driven Robot Test Script for EMIO Lab
+
+This script allows you to test and actuate a cable-driven continuum/soft robot
+using the EMIO hardware (Dynamixel motor interface via emioapi).
+
+Features:
+- Safe homing & graceful shutdown (releases cable tension on exit / Ctrl+C)
+- Smooth trajectory interpolation (avoids abrupt tension spikes on cables)
+- Motion tests:
+    1. Individual Cable / Motor Calibration & Tension Test
+    2. Antagonistic Bending (Bending along X and Y axes)
+    3. Coordinated Circular / Orbital Bending (Sinusoidal trajectory)
+    4. Full automated demo routine
+    5. Interactive manual control (set specific motor angles)
+- Hardware auto-detect with Mock/Simulation fallback if robot is not plugged in.
+"""
+
+import math
+import sys
+import time
+
+# Try importing the official EMIO API
+try:
+    from emioapi import emio
+    HAS_EMIO_API = True
+except ImportError:
+    HAS_EMIO_API = False
+    emio = None
+
+
+class CableDrivenRobotController:
+    def __init__(self, min_angle=0.0, max_angle=math.pi / 2.0, num_motors=4):
+        """
+        Initialize the cable-driven robot controller.
+        
+        :param min_angle: Minimum safe motor angle in radians (typically 0.0, cable fully released/slack)
+        :param max_angle: Maximum safe motor angle in radians (default ~pi/2 = 90 deg for soft cable pulling)
+        :param num_motors: Number of actuation cables/motors (standard EMIO has 4)
+        """
+        self.min_angle = min_angle
+        self.max_angle = max_angle
+        self.num_motors = num_motors
+        self.current_angles = [0.0] * num_motors
+        self.is_connected = False
+        self.is_mock = False
+
+    def connect(self, port=None):
+        """Establish connection to EMIO hardware or fallback to mock mode."""
+        print("\n==========================================")
+        print(" Connecting to EMIO Cable-Driven Robot...")
+        print("==========================================")
+
+        if HAS_EMIO_API:
+            try:
+                if port:
+                    emio.connectToEmioDevice(port=port)
+                else:
+                    emio.connectToEmioDevice()
+                self.is_connected = True
+                self.is_mock = False
+                print("[INFO] Successfully connected to EMIO hardware!")
+            except Exception as e:
+                print(f"[WARN] Could not connect to physical EMIO device ({e}).")
+                print("[INFO] Falling back to SIMULATION / MOCK mode for dry testing.")
+                self.is_connected = True
+                self.is_mock = True
+        else:
+            print("[WARN] 'emioapi' is not installed in current Python environment.")
+            print("[INFO] Running in SIMULATION / MOCK mode.")
+            print("[TIP]  To connect to real hardware, install emioapi: pip install emioapi")
+            self.is_connected = True
+            self.is_mock = True
+
+        # Home the robot immediately upon connection
+        self.home()
+
+    def clamp_angles(self, angles):
+        """Clamps angle commands to safe operating range [min_angle, max_angle]."""
+        clamped = []
+        for a in angles:
+            val = max(self.min_angle, min(self.max_angle, a))
+            clamped.append(val)
+        return clamped
+
+    def send_angles(self, angles):
+        """Send target angles to motors."""
+        safe_angles = self.clamp_angles(angles)
+        self.current_angles = list(safe_angles)
+
+        if not self.is_mock and HAS_EMIO_API:
+            try:
+                emio.motors.angles = safe_angles
+            except Exception as e:
+                print(f"[ERROR] Failed to send angles to EMIO: {e}")
+        else:
+            # Print compact mock representation
+            deg_str = ", ".join([f"M{i+1}:{math.degrees(a):5.1f}°" for i, a in enumerate(safe_angles)])
+            print(f" [SIM MOTOR OUTPUT] -> {deg_str}", end="\r", flush=True)
+
+    def move_smooth(self, target_angles, duration=1.5, steps=30):
+        """
+        Smoothly interpolates motor angles from current positions to target_angles
+        using minimum-jerk / cosine easing to protect soft cables and structures.
+        """
+        start_angles = list(self.current_angles)
+        target_angles = self.clamp_angles(target_angles)
+        dt = duration / float(steps)
+
+        for s in range(1, steps + 1):
+            # Cosine S-curve interpolation (0.0 to 1.0)
+            alpha = (1.0 - math.cos(math.pi * (s / float(steps)))) / 2.0
+            interpolated = [
+                start_angles[i] + alpha * (target_angles[i] - start_angles[i])
+                for i in range(self.num_motors)
+            ]
+            self.send_angles(interpolated)
+            time.sleep(dt)
+
+        if self.is_mock:
+            print()  # newline after step prints
+
+    def home(self):
+        """Returns all motors to the neutral / fully relaxed home position (0 radians)."""
+        print("\n[ROBOT] Homing: Releasing tension on all cables...")
+        self.move_smooth([0.0] * self.num_motors, duration=1.0)
+        print("[ROBOT] Robot is in neutral home position.")
+
+    # -------------------------------------------------------------
+    # Motion Test Routines
+    # -------------------------------------------------------------
+
+    def test_single_cable_actuation(self, pull_angle=0.45):
+        """
+        Movement 1: Sequentially pulls and releases each cable one by one.
+        Helps verify motor numbering, cable routing, and tension mapping.
+        """
+        print("\n>>> TEST 1: Sequential Single-Cable Pull & Release <<<")
+        self.home()
+        time.sleep(0.5)
+
+        for i in range(self.num_motors):
+            print(f"\n -> Pulling Cable {i+1} (Motor {i+1}) to {math.degrees(pull_angle):.1f}°...")
+            target = [0.0] * self.num_motors
+            target[i] = pull_angle
+            self.move_smooth(target, duration=1.2)
+            time.sleep(0.8)
+
+            print(f" -> Releasing Cable {i+1} back to neutral...")
+            self.move_smooth([0.0] * self.num_motors, duration=1.0)
+            time.sleep(0.4)
+
+        print("\n[OK] Single cable test complete.")
+
+    def test_antagonistic_bending(self, pull_angle=0.5):
+        """
+        Movement 2: Antagonistic pair bending.
+        Assumes 4-cable setup spaced at 90-degree intervals:
+        - Pair X: Motor 1 vs Motor 3 (+X and -X bending)
+        - Pair Y: Motor 2 vs Motor 4 (+Y and -Y bending)
+        """
+        print("\n>>> TEST 2: Antagonistic Bending (4 Quadrants) <<<")
+        self.home()
+        time.sleep(0.5)
+
+        directions = [
+            ("+X Bending", [pull_angle, 0.0, 0.0, 0.0]),
+            ("-X Bending", [0.0, 0.0, pull_angle, 0.0]),
+            ("+Y Bending", [0.0, pull_angle, 0.0, 0.0]),
+            ("-Y Bending", [0.0, 0.0, 0.0, pull_angle]),
+        ]
+
+        for name, pose in directions:
+            print(f"\n -> Bending towards: {name}")
+            self.move_smooth(pose, duration=1.5)
+            time.sleep(1.0)
+            print(" -> Returning to neutral...")
+            self.move_smooth([0.0] * self.num_motors, duration=1.0)
+            time.sleep(0.3)
+
+        print("\n[OK] Antagonistic bending test complete.")
+
+    def test_circular_orbit(self, max_pull=0.45, cycles=2, duration_per_cycle=4.0):
+        """
+        Movement 3: Coordinated circular/orbital motion (continuously rotating bending angle).
+        Actuates adjacent cable pairs sinusoidally to produce a continuous 360-degree sweep.
+        """
+        print(f"\n>>> TEST 3: Coordinated Circular/Orbital Sweep ({cycles} cycles) <<<")
+        self.home()
+        time.sleep(0.5)
+
+        steps_per_cycle = 40
+        total_steps = cycles * steps_per_cycle
+        dt = duration_per_cycle / float(steps_per_cycle)
+
+        print(" -> Sweeping continuously...")
+        for s in range(total_steps + 1):
+            theta = 2.0 * math.pi * (s / float(steps_per_cycle))
+            # Direction vector in polar coordinates
+            # Motor 1: 0 rad (X+), Motor 2: pi/2 (Y+), Motor 3: pi (X-), Motor 4: 3pi/2 (Y-)
+            motor_phases = [0.0, math.pi / 2.0, math.pi, 3.0 * math.pi / 2.0]
+
+            angles = []
+            for phase in motor_phases:
+                # Cable pulls when projected component along its direction is positive
+                val = max(0.0, math.cos(theta - phase)) * max_pull
+                angles.append(val)
+
+            self.send_angles(angles)
+            time.sleep(dt)
+
+        if self.is_mock:
+            print()
+
+        print(" -> Returning to home position...")
+        self.move_smooth([0.0] * self.num_motors, duration=1.5)
+        print("\n[OK] Circular sweep test complete.")
+
+    def run_all_tests(self):
+        """Runs the complete sequence of tests."""
+        print("\n==========================================")
+        print(" STARTING FULL CABLE-DRIVEN DEMO ROUTINE")
+        print("==========================================")
+        self.test_single_cable_actuation(pull_angle=0.4)
+        time.sleep(1.0)
+        self.test_antagonistic_bending(pull_angle=0.45)
+        time.sleep(1.0)
+        self.test_circular_orbit(max_pull=0.4, cycles=2)
+        time.sleep(0.5)
+        self.home()
+        print("\n==========================================")
+        print(" ALL TESTS COMPLETED SUCCESSFULLY!")
+        print("==========================================")
+
+    def disconnect(self):
+        """Safely release tension and close connection."""
+        print("\n[ROBOT] Safely relaxing tension before disconnecting...")
+        try:
+            self.home()
+        except Exception:
+            pass
+
+        if not self.is_mock and HAS_EMIO_API:
+            try:
+                emio.disconnect()
+                print("[ROBOT] Disconnected from EMIO.")
+            except Exception as e:
+                print(f"[WARN] Error while disconnecting: {e}")
+        self.is_connected = False
+
+
+def print_menu():
+    print("\n----------------- EMIO Cable-Driven Menu -----------------")
+    print(" 1. Run Full Automated Demo (All Movements)")
+    print(" 2. Test 1: Single Cable Actuation (Motors 1 to 4)")
+    print(" 3. Test 2: Antagonistic Bending (+X, -X, +Y, -Y)")
+    print(" 4. Test 3: Continuous Circular Orbit / Sweep")
+    print(" 5. Home / Relax All Cables (0.0 rad)")
+    print(" 6. Manual Angle Input (Set 4 angles in degrees)")
+    print(" 7. Launch Graphical User Interface (GUI)")
+    print(" 8. Exit")
+    print("---------------------------------------------------------")
+
+
+def main():
+    if "--gui" in sys.argv or "-g" in sys.argv:
+        try:
+            import cabledriven_gui
+            cabledriven_gui.main()
+            return
+        except Exception as e:
+            print(f"[ERROR] Failed to start GUI: {e}")
+            return
+
+    robot = CableDrivenRobotController(min_angle=0.0, max_angle=math.pi / 2.0, num_motors=4)
+
+    try:
+        robot.connect()
+
+        while True:
+            print_menu()
+            choice = input("Enter choice (1-8) [or 'q' to quit]: ").strip()
+
+            if choice in ["1", "demo"]:
+                robot.run_all_tests()
+            elif choice == "2":
+                robot.test_single_cable_actuation()
+            elif choice == "3":
+                robot.test_antagonistic_bending()
+            elif choice == "4":
+                robot.test_circular_orbit()
+            elif choice == "5":
+                robot.home()
+            elif choice == "6":
+                print("\nEnter 4 angles in degrees (e.g. '30 0 0 0' or '25 25 0 0'):")
+                inp = input("Angles (deg, 0 to 90): ").strip()
+                try:
+                    degs = [float(x) for x in inp.replace(",", " ").split()]
+                    if len(degs) != 4:
+                        print("[ERROR] Please provide exactly 4 values separated by space.")
+                        continue
+                    rads = [math.radians(d) for d in degs]
+                    print(f"Moving to: {degs}°...")
+                    robot.move_smooth(rads, duration=1.5)
+                except ValueError:
+                    print("[ERROR] Invalid numeric input.")
+            elif choice in ["7", "gui"]:
+                robot.disconnect()
+                import cabledriven_gui
+                cabledriven_gui.main()
+                break
+            elif choice in ["8", "q", "exit", "quit"]:
+                print("Exiting...")
+                break
+            else:
+                print("[WARN] Invalid option, please try again.")
+
+    except KeyboardInterrupt:
+        print("\n\n[INFO] Keyboard interrupt detected (Ctrl+C). Stopping immediately.")
+    finally:
+        robot.disconnect()
+
+
+if __name__ == "__main__":
+    main()
+
