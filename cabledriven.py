@@ -19,25 +19,31 @@ Features:
 """
 
 import math
+import os
 import sys
 import time
 
 # Try importing the official EMIO API
 try:
-    from emioapi import emio
+    from emioapi import EmioAPI
     HAS_EMIO_API = True
-except ImportError:
+except Exception:
     HAS_EMIO_API = False
-    emio = None
+    EmioAPI = None
+
+
+# Software limit for motor angles. The motors themselves allow about +/-180 deg;
+# how far the cables and soft body can safely go depends on the build.
+MAX_ANGLE_DEG = 180.0
 
 
 class CableDrivenRobotController:
-    def __init__(self, min_angle=0.0, max_angle=math.pi / 2.0, num_motors=4):
+    def __init__(self, min_angle=0.0, max_angle=math.radians(MAX_ANGLE_DEG), num_motors=4):
         """
         Initialize the cable-driven robot controller.
         
         :param min_angle: Minimum safe motor angle in radians (typically 0.0, cable fully released/slack)
-        :param max_angle: Maximum safe motor angle in radians (default ~pi/2 = 90 deg for soft cable pulling)
+        :param max_angle: Maximum safe motor angle in radians (default pi = 180 deg, the motor travel limit)
         :param num_motors: Number of actuation cables/motors (standard EMIO has 4)
         """
         self.min_angle = min_angle
@@ -46,6 +52,7 @@ class CableDrivenRobotController:
         self.current_angles = [0.0] * num_motors
         self.is_connected = False
         self.is_mock = False
+        self.emio = None
 
     def connect(self, port=None):
         """Establish connection to EMIO hardware or fallback to mock mode."""
@@ -53,15 +60,36 @@ class CableDrivenRobotController:
         print(" Connecting to EMIO Cable-Driven Robot...")
         print("==========================================")
 
+        if self.emio is not None:
+            print("[INFO] Already connected to EMIO hardware.")
+            return
+
         if HAS_EMIO_API:
             try:
-                if port:
-                    emio.connectToEmioDevice(port=port)
-                else:
-                    emio.connectToEmioDevice()
+                devices = EmioAPI.listEmioDevices()
+                if not devices:
+                    raise RuntimeError("no EMIO motor board found (is it plugged in?)")
+                for dev in ([port] if port else devices):
+                    if not os.access(dev, os.R_OK | os.W_OK):
+                        raise PermissionError(
+                            f"no read/write access to {dev}. "
+                            "Add your user to the 'dialout' group and log in again."
+                        )
+
+                # Only the motors are needed here, so skip the camera.
+                emio = EmioAPI()
+                if not emio.motors.open(port):
+                    raise RuntimeError("could not open the EMIO motors")
+                self.emio = emio
+
+                # Start interpolating from where the motors really are, not from 0.
+                self.current_angles = [float(a) for a in emio.motors.angles]
                 self.is_connected = True
                 self.is_mock = False
-                print("[INFO] Successfully connected to EMIO hardware!")
+                print(f"[INFO] Successfully connected to EMIO hardware on {emio.motors.device_name}!")
+                deg_str = ", ".join(f"M{i+1}:{math.degrees(a):6.1f}°" for i, a in enumerate(self.current_angles))
+                print(f"[INFO] Current motor angles: {deg_str}")
+                print("[INFO] Motors were NOT moved. Use 'Home' (menu 5) to send them to 0.")
             except Exception as e:
                 print(f"[WARN] Could not connect to physical EMIO device ({e}).")
                 print("[INFO] Falling back to SIMULATION / MOCK mode for dry testing.")
@@ -71,11 +99,15 @@ class CableDrivenRobotController:
             print("[WARN] 'emioapi' is not installed in current Python environment.")
             print("[INFO] Running in SIMULATION / MOCK mode.")
             print("[TIP]  To connect to real hardware, install emioapi: pip install emioapi")
+            print("[TIP]  If it is installed, the import failed: check that its dependencies load.")
             self.is_connected = True
             self.is_mock = True
 
-        # Home the robot immediately upon connection
-        self.home()
+        # Only home automatically in simulation. On real hardware, 0 rad is the
+        # motor centre position, which is not necessarily a slack cable, so the
+        # user must ask for it explicitly.
+        if self.is_mock:
+            self.home()
 
     def clamp_angles(self, angles):
         """Clamps angle commands to safe operating range [min_angle, max_angle]."""
@@ -90,9 +122,9 @@ class CableDrivenRobotController:
         safe_angles = self.clamp_angles(angles)
         self.current_angles = list(safe_angles)
 
-        if not self.is_mock and HAS_EMIO_API:
+        if not self.is_mock and self.emio is not None:
             try:
-                emio.motors.angles = safe_angles
+                self.emio.motors.angles = safe_angles
             except Exception as e:
                 print(f"[ERROR] Failed to send angles to EMIO: {e}")
         else:
@@ -132,7 +164,7 @@ class CableDrivenRobotController:
     # Motion Test Routines
     # -------------------------------------------------------------
 
-    def test_single_cable_actuation(self, pull_angle=0.45):
+    def test_single_cable_actuation(self, pull_angle=0.9):
         """
         Movement 1: Sequentially pulls and releases each cable one by one.
         Helps verify motor numbering, cable routing, and tension mapping.
@@ -223,7 +255,7 @@ class CableDrivenRobotController:
         print("\n==========================================")
         print(" STARTING FULL CABLE-DRIVEN DEMO ROUTINE")
         print("==========================================")
-        self.test_single_cable_actuation(pull_angle=0.4)
+        self.test_single_cable_actuation(pull_angle=0.8)
         time.sleep(1.0)
         self.test_antagonistic_bending(pull_angle=0.45)
         time.sleep(1.0)
@@ -236,19 +268,75 @@ class CableDrivenRobotController:
 
     def disconnect(self):
         """Safely release tension and close connection."""
-        print("\n[ROBOT] Safely relaxing tension before disconnecting...")
-        try:
-            self.home()
-        except Exception:
-            pass
-
-        if not self.is_mock and HAS_EMIO_API:
+        if self.is_mock:
+            print("\n[ROBOT] Safely relaxing tension before disconnecting...")
             try:
-                emio.disconnect()
+                self.home()
+            except Exception:
+                pass
+
+        if not self.is_mock and self.emio is not None:
+            try:
+                print("\n[ROBOT] Disabling motor torque and closing the port (motors are not moved).")
+                self.emio.motors.close()
                 print("[ROBOT] Disconnected from EMIO.")
             except Exception as e:
                 print(f"[WARN] Error while disconnecting: {e}")
+            self.emio = None
         self.is_connected = False
+
+
+def check_hardware():
+    """
+    Read-only hardware check: reports the port, access rights and motor state.
+    It only pings and reads registers, it never writes to the motors.
+    """
+    print("\n=== EMIO hardware check (read-only) ===")
+    if not HAS_EMIO_API:
+        print("[FAIL] 'emioapi' could not be imported.")
+        return
+
+    devices = EmioAPI.listEmioDevices()
+    if not devices:
+        print("[FAIL] No EMIO motor board found. Is it plugged in?")
+        return
+    print(f"[OK]   Motor board(s) found: {devices}")
+
+    port = devices[0]
+    if not os.access(port, os.R_OK | os.W_OK):
+        print(f"[FAIL] No read/write access to {port}. Add your user to 'dialout' and log in again.")
+        return
+    print(f"[OK]   Read/write access to {port}")
+
+    from dynamixel_sdk import PortHandler, PacketHandler
+    from emioapi import _emiomotorsparameters as params
+
+    ph = PortHandler(port)
+    pk = PacketHandler(params.PROTOCOL_VERSION)
+    if not ph.openPort():
+        print(f"[FAIL] Could not open {port} (is another program using it?).")
+        return
+    try:
+        ph.setBaudRate(params.BAUDRATE)
+        # Register map of the XM430-W210 (model 1030), as used by emioapi.
+        addr_torque, addr_present = 64, 132
+        for motor_id in params.DXL_IDs:
+            model, comm, _ = pk.ping(ph, motor_id)
+            if comm != 0:
+                print(f"[FAIL] Motor ID {motor_id}: no response ({pk.getTxRxResult(comm)})")
+                continue
+            line = f"[OK]   Motor ID {motor_id}: model {model}"
+            if model == 1030:
+                torque, _, _ = pk.read1ByteTxRx(ph, motor_id, addr_torque)
+                pulse, _, _ = pk.read4ByteTxRx(ph, motor_id, addr_present)
+                deg = (2048 - pulse) * 360.0 / 4096.0
+                line += f" | torque={'on' if torque else 'off'} | position={pulse} pulses = {deg:6.1f}° (0° = pulse 2048)"
+            else:
+                line += " | unexpected model, position not read"
+            print(line)
+    finally:
+        ph.closePort()
+    print("=== Nothing was moved. ===")
 
 
 def print_menu():
@@ -265,6 +353,10 @@ def print_menu():
 
 
 def main():
+    if "--check" in sys.argv:
+        check_hardware()
+        return
+
     if "--gui" in sys.argv or "-g" in sys.argv:
         try:
             import cabledriven_gui
@@ -274,7 +366,7 @@ def main():
             print(f"[ERROR] Failed to start GUI: {e}")
             return
 
-    robot = CableDrivenRobotController(min_angle=0.0, max_angle=math.pi / 2.0, num_motors=4)
+    robot = CableDrivenRobotController(min_angle=0.0, max_angle=math.radians(MAX_ANGLE_DEG), num_motors=4)
 
     try:
         robot.connect()
@@ -295,7 +387,7 @@ def main():
                 robot.home()
             elif choice == "6":
                 print("\nEnter 4 angles in degrees (e.g. '30 0 0 0' or '25 25 0 0'):")
-                inp = input("Angles (deg, 0 to 90): ").strip()
+                inp = input(f"Angles (deg, 0 to {MAX_ANGLE_DEG:g}): ").strip()
                 try:
                     degs = [float(x) for x in inp.replace(",", " ").split()]
                     if len(degs) != 4:
