@@ -159,7 +159,7 @@ class CableDrivenRobotController:
     # Motion Test Routines
     # -------------------------------------------------------------
 
-    def test_single_cable_actuation(self, pull_angle=0.45):
+    def test_single_cable_actuation(self, pull_angle=0.9):
         """
         Movement 1: Sequentially pulls and releases each cable one by one.
         Helps verify motor numbering, cable routing, and tension mapping.
@@ -250,7 +250,7 @@ class CableDrivenRobotController:
         print("\n==========================================")
         print(" STARTING FULL CABLE-DRIVEN DEMO ROUTINE")
         print("==========================================")
-        self.test_single_cable_actuation(pull_angle=0.4)
+        self.test_single_cable_actuation(pull_angle=0.8)
         time.sleep(1.0)
         self.test_antagonistic_bending(pull_angle=0.45)
         time.sleep(1.0)
