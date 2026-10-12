@@ -32,13 +32,18 @@ except Exception:
     EmioAPI = None
 
 
+# Software limit for motor angles. The motors themselves allow about +/-180 deg;
+# how far the cables and soft body can safely go depends on the build.
+MAX_ANGLE_DEG = 180.0
+
+
 class CableDrivenRobotController:
-    def __init__(self, min_angle=0.0, max_angle=math.pi / 2.0, num_motors=4):
+    def __init__(self, min_angle=0.0, max_angle=math.radians(MAX_ANGLE_DEG), num_motors=4):
         """
         Initialize the cable-driven robot controller.
         
         :param min_angle: Minimum safe motor angle in radians (typically 0.0, cable fully released/slack)
-        :param max_angle: Maximum safe motor angle in radians (default ~pi/2 = 90 deg for soft cable pulling)
+        :param max_angle: Maximum safe motor angle in radians (default pi = 180 deg, the motor travel limit)
         :param num_motors: Number of actuation cables/motors (standard EMIO has 4)
         """
         self.min_angle = min_angle
@@ -361,7 +366,7 @@ def main():
             print(f"[ERROR] Failed to start GUI: {e}")
             return
 
-    robot = CableDrivenRobotController(min_angle=0.0, max_angle=math.pi / 2.0, num_motors=4)
+    robot = CableDrivenRobotController(min_angle=0.0, max_angle=math.radians(MAX_ANGLE_DEG), num_motors=4)
 
     try:
         robot.connect()
@@ -382,7 +387,7 @@ def main():
                 robot.home()
             elif choice == "6":
                 print("\nEnter 4 angles in degrees (e.g. '30 0 0 0' or '25 25 0 0'):")
-                inp = input("Angles (deg, 0 to 90): ").strip()
+                inp = input(f"Angles (deg, 0 to {MAX_ANGLE_DEG:g}): ").strip()
                 try:
                     degs = [float(x) for x in inp.replace(",", " ").split()]
                     if len(degs) != 4:

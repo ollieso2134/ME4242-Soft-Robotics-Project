@@ -20,16 +20,17 @@ from tkinter import ttk, messagebox
 
 # Import controller logic from cabledriven.py
 try:
-    from cabledriven import CableDrivenRobotController, HAS_EMIO_API
+    from cabledriven import CableDrivenRobotController, HAS_EMIO_API, MAX_ANGLE_DEG
 except ImportError:
     # Fallback minimal import if moved
     HAS_EMIO_API = False
+    MAX_ANGLE_DEG = 180.0
     class CableDrivenRobotController:
         def __init__(self, **kwargs):
             self.current_angles = [0.0] * 4
             self.is_connected = False
             self.is_mock = True
-            self.max_angle = math.pi / 2.0
+            self.max_angle = math.radians(MAX_ANGLE_DEG)
             self.min_angle = 0.0
             self.num_motors = 4
         def connect(self, port=None): self.is_connected = True
@@ -61,10 +62,10 @@ class CableRobotGUI:
         self.root.configure(bg=self.bg_dark)
 
         # Hardware Controller
-        self.robot = CableDrivenRobotController(min_angle=0.0, max_angle=math.pi / 2.0, num_motors=4)
+        self.robot = CableDrivenRobotController(min_angle=0.0, max_angle=math.radians(MAX_ANGLE_DEG), num_motors=4)
         self.is_moving_thread = False
         self.motor_vars = [tk.DoubleVar(value=0.0) for _ in range(4)]
-        self.max_limit_var = tk.DoubleVar(value=90.0)  # Max angle limit in degrees
+        self.max_limit_var = tk.DoubleVar(value=MAX_ANGLE_DEG)  # Max angle limit in degrees
 
         self.setup_ui()
         self.connect_hardware()
@@ -127,7 +128,7 @@ class CableRobotGUI:
     def create_slider_controls(self, parent):
         group = tk.LabelFrame(
             parent,
-            text=" Individual Motor / Cable Tension (0° - 90°) ",
+            text=f" Individual Motor / Cable Tension (0° - {MAX_ANGLE_DEG:g}°) ",
             font=("Segoe UI", 11, "bold"),
             fg=self.accent_color,
             bg=self.panel_bg,
@@ -167,7 +168,7 @@ class CableRobotGUI:
             slider = tk.Scale(
                 m_frame,
                 from_=0.0,
-                to=90.0,
+                to=MAX_ANGLE_DEG,
                 orient=tk.HORIZONTAL,
                 resolution=0.5,
                 variable=self.motor_vars[i],
@@ -305,7 +306,7 @@ class CableRobotGUI:
 
         for i, (ax, ay, label, color) in enumerate(anchors):
             deg = self.motor_vars[i].get()
-            tension_norm = deg / 90.0  # 0.0 to 1.0
+            tension_norm = deg / MAX_ANGLE_DEG  # 0.0 to 1.0
 
             # Draw anchor circle
             self.canvas.create_oval(ax - 7, ay - 7, ax + 7, ay + 7, fill=color, outline="")
@@ -521,7 +522,7 @@ class CableRobotGUI:
         limit_spin = tk.Spinbox(
             limit_frame,
             from_=15.0,
-            to=90.0,
+            to=MAX_ANGLE_DEG,
             increment=5.0,
             textvariable=self.max_limit_var,
             width=5,
