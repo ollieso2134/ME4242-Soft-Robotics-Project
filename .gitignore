@@ -1,6 +1,7 @@
 # Custom
 modules/site-packages/
 *.pptx
+diagnostics.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -53,6 +53,57 @@ class CableDrivenRobotController:
         self.is_connected = False
         self.is_mock = False
         self.emio = None
+        self.port = None
+        self.camera = None
+        self.camera_serial = None
+        self.last_connection_error = None
+
+    def connect_camera(self, camera_serial=None, track_markers=False):
+        """
+        Connect to Intel RealSense D405 depth camera via emioapi.
+        
+        :param camera_serial: Camera serial number (str). If None, auto-selects first detected camera.
+        :param track_markers: Enable automatic soft robot marker tracking.
+        :return: (bool success, str message)
+        """
+        if not HAS_EMIO_API:
+            return False, "emioapi is not installed."
+
+        try:
+            from emioapi import EmioCamera
+            cameras = EmioCamera.listCameras()
+            target_serial = camera_serial or (cameras[0] if cameras else None)
+            if not target_serial:
+                return False, "No RealSense camera detected. Is it plugged in?"
+
+            if self.camera is not None:
+                try:
+                    self.camera.close()
+                except Exception:
+                    pass
+
+            cam = EmioCamera(camera_serial=target_serial, track_markers=track_markers, show=False)
+            if not cam.open(target_serial):
+                return False, f"Failed to open RealSense camera {target_serial}"
+
+            self.camera = cam
+            self.camera_serial = target_serial
+            print(f"[INFO] Successfully connected to RealSense Camera: {target_serial}")
+            return True, f"Connected to RealSense ({target_serial})"
+        except Exception as e:
+            print(f"[WARN] Error connecting to camera: {e}")
+            return False, str(e)
+
+    def disconnect_camera(self):
+        """Disconnect and release the RealSense camera."""
+        if self.camera is not None:
+            try:
+                self.camera.close()
+                print("[INFO] Camera disconnected.")
+            except Exception as e:
+                print(f"[WARN] Error closing camera: {e}")
+            self.camera = None
+            self.camera_serial = None
 
     def connect(self, port=None):
         """Establish connection to EMIO hardware or fallback to mock mode."""
@@ -61,41 +112,54 @@ class CableDrivenRobotController:
         print("==========================================")
 
         if self.emio is not None:
-            print("[INFO] Already connected to EMIO hardware.")
-            return
+            print("[INFO] Reconnecting: closing existing connection first...")
+            try:
+                self.disconnect()
+            except Exception:
+                pass
 
         if HAS_EMIO_API:
             try:
-                devices = EmioAPI.listEmioDevices()
-                if not devices:
-                    raise RuntimeError("no EMIO motor board found (is it plugged in?)")
-                for dev in ([port] if port else devices):
-                    if not os.access(dev, os.R_OK | os.W_OK):
+                target_port = port
+                if not target_port:
+                    devices = EmioAPI.listEmioDevices()
+                    if devices:
+                        target_port = devices[0]
+                    else:
+                        raise RuntimeError("no EMIO motor board found (is it plugged in?)")
+
+                # Check read/write permission only on POSIX/Linux devices (not Windows COM ports)
+                if os.name != 'nt' and isinstance(target_port, str) and target_port.startswith('/'):
+                    if not os.access(target_port, os.R_OK | os.W_OK):
                         raise PermissionError(
-                            f"no read/write access to {dev}. "
+                            f"no read/write access to {target_port}. "
                             "Add your user to the 'dialout' group and log in again."
                         )
 
                 # Only the motors are needed here, so skip the camera.
                 emio = EmioAPI()
-                if not emio.motors.open(port):
-                    raise RuntimeError("could not open the EMIO motors")
+                if not emio.motors.open(target_port):
+                    raise RuntimeError(f"could not open the EMIO motors on port {target_port}")
                 self.emio = emio
+                self.port = target_port
 
                 # Start interpolating from where the motors really are, not from 0.
                 self.current_angles = [float(a) for a in emio.motors.angles]
                 self.is_connected = True
                 self.is_mock = False
-                print(f"[INFO] Successfully connected to EMIO hardware on {emio.motors.device_name}!")
+                self.last_connection_error = None
+                print(f"[INFO] Successfully connected to EMIO hardware on {emio.motors.device_name} ({target_port})!")
                 deg_str = ", ".join(f"M{i+1}:{math.degrees(a):6.1f}°" for i, a in enumerate(self.current_angles))
                 print(f"[INFO] Current motor angles: {deg_str}")
                 print("[INFO] Motors were NOT moved. Use 'Home' (menu 5) to send them to 0.")
             except Exception as e:
+                self.last_connection_error = str(e)
                 print(f"[WARN] Could not connect to physical EMIO device ({e}).")
                 print("[INFO] Falling back to SIMULATION / MOCK mode for dry testing.")
                 self.is_connected = True
                 self.is_mock = True
         else:
+            self.last_connection_error = "emioapi is not installed"
             print("[WARN] 'emioapi' is not installed in current Python environment.")
             print("[INFO] Running in SIMULATION / MOCK mode.")
             print("[TIP]  To connect to real hardware, install emioapi: pip install emioapi")
@@ -117,9 +181,9 @@ class CableDrivenRobotController:
             clamped.append(val)
         return clamped
 
-    def send_angles(self, angles):
+    def send_angles(self, angles, clamp=True):
         """Send target angles to motors."""
-        safe_angles = self.clamp_angles(angles)
+        safe_angles = self.clamp_angles(angles) if clamp else list(angles)
         self.current_angles = list(safe_angles)
 
         if not self.is_mock and self.emio is not None:
@@ -148,9 +212,10 @@ class CableDrivenRobotController:
                 start_angles[i] + alpha * (target_angles[i] - start_angles[i])
                 for i in range(self.num_motors)
             ]
-            self.send_angles(interpolated)
+            self.send_angles(interpolated, clamp=False)
             time.sleep(dt)
 
+        self.current_angles = list(target_angles)
         if self.is_mock:
             print()  # newline after step prints
 
@@ -283,10 +348,11 @@ class CableDrivenRobotController:
             except Exception as e:
                 print(f"[WARN] Error while disconnecting: {e}")
             self.emio = None
+        self.disconnect_camera()
         self.is_connected = False
 
 
-def check_hardware():
+def check_hardware(port=None):
     """
     Read-only hardware check: reports the port, access rights and motor state.
     It only pings and reads registers, it never writes to the motors.
@@ -297,24 +363,27 @@ def check_hardware():
         return
 
     devices = EmioAPI.listEmioDevices()
-    if not devices:
+    target_port = port or (devices[0] if devices else None)
+    if not target_port:
         print("[FAIL] No EMIO motor board found. Is it plugged in?")
         return
-    print(f"[OK]   Motor board(s) found: {devices}")
+    print(f"[OK]   Motor board found on port: {target_port}")
 
-    port = devices[0]
-    if not os.access(port, os.R_OK | os.W_OK):
-        print(f"[FAIL] No read/write access to {port}. Add your user to 'dialout' and log in again.")
-        return
-    print(f"[OK]   Read/write access to {port}")
+    if os.name != 'nt' and str(target_port).startswith('/'):
+        if not os.access(target_port, os.R_OK | os.W_OK):
+            print(f"[FAIL] No read/write access to {target_port}. Add your user to 'dialout' and log in again.")
+            return
+        print(f"[OK]   Read/write access to {target_port}")
+    else:
+        print(f"[OK]   Port access ready on {target_port}")
 
     from dynamixel_sdk import PortHandler, PacketHandler
     from emioapi import _emiomotorsparameters as params
 
-    ph = PortHandler(port)
+    ph = PortHandler(target_port)
     pk = PacketHandler(params.PROTOCOL_VERSION)
     if not ph.openPort():
-        print(f"[FAIL] Could not open {port} (is another program using it?).")
+        print(f"[FAIL] Could not open {target_port} (is another program using it?).")
         return
     try:
         ph.setBaudRate(params.BAUDRATE)
@@ -348,19 +417,37 @@ def print_menu():
     print(" 5. Home / Relax All Cables (0.0 rad)")
     print(" 6. Manual Angle Input (Set 4 angles in degrees)")
     print(" 7. Launch Graphical User Interface (GUI)")
-    print(" 8. Exit")
+    print(" 8. Launch RealSense Camera Viewer & Tracker")
+    print(" 9. Exit")
     print("---------------------------------------------------------")
 
 
 def main():
-    if "--check" in sys.argv:
-        check_hardware()
+    import argparse
+    parser = argparse.ArgumentParser(description="EMIO Cable-Driven Robot Controller")
+    parser.add_argument("--port", type=str, default=None, help="Serial port to connect (e.g. COM12 or /dev/ttyUSB0)")
+    parser.add_argument("--check", action="store_true", help="Run read-only hardware check")
+    parser.add_argument("--gui", "-g", action="store_true", help="Launch Graphical User Interface (GUI)")
+    parser.add_argument("--camera", "-c", action="store_true", help="Launch RealSense Camera Viewer")
+    args = parser.parse_args()
+
+    if args.check:
+        check_hardware(port=args.port)
         return
 
-    if "--gui" in sys.argv or "-g" in sys.argv:
+    if args.camera:
+        try:
+            import camera_viewer
+            camera_viewer.main()
+            return
+        except Exception as e:
+            print(f"[ERROR] Failed to start Camera Viewer: {e}")
+            return
+
+    if args.gui:
         try:
             import cabledriven_gui
-            cabledriven_gui.main()
+            cabledriven_gui.main(port=args.port)
             return
         except Exception as e:
             print(f"[ERROR] Failed to start GUI: {e}")
@@ -369,11 +456,11 @@ def main():
     robot = CableDrivenRobotController(min_angle=0.0, max_angle=math.radians(MAX_ANGLE_DEG), num_motors=4)
 
     try:
-        robot.connect()
+        robot.connect(port=args.port)
 
         while True:
             print_menu()
-            choice = input("Enter choice (1-8) [or 'q' to quit]: ").strip()
+            choice = input("Enter choice (1-9) [or 'q' to quit]: ").strip()
 
             if choice in ["1", "demo"]:
                 robot.run_all_tests()
@@ -401,9 +488,12 @@ def main():
             elif choice in ["7", "gui"]:
                 robot.disconnect()
                 import cabledriven_gui
-                cabledriven_gui.main()
+                cabledriven_gui.main(port=args.port)
                 break
-            elif choice in ["8", "q", "exit", "quit"]:
+            elif choice in ["8", "cam", "camera"]:
+                import camera_viewer
+                camera_viewer.main()
+            elif choice in ["9", "q", "exit", "quit"]:
                 print("Exiting...")
                 break
             else:
