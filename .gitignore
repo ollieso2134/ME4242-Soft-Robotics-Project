@@ -2,6 +2,8 @@
 modules/site-packages/
 *.pptx
 diagnostics.md
+simulation/
+assets/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

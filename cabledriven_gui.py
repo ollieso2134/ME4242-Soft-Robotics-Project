@@ -52,8 +52,16 @@ except ImportError:
         def move_smooth(self, a, duration=1.0): self.current_angles = a
         def home(self): self.current_angles = [0.0] * 4
 
-# Import visual servoing and trajectory planner
-from visual_servoing import ColorDetector, BezierTrajectory, VisualServoController, PickAndPlaceManager
+# Import visual servoing, obstacle planner, and retrieval managers
+from visual_servoing import (
+    ColorDetector,
+    BezierTrajectory,
+    VisualServoController,
+    PickAndPlaceManager,
+    ObstacleEnvironment,
+    ObstacleAidedRetriever,
+    SimulatedObstacleCamera,
+)
 
 # Cross-platform Operating System & Font Detection
 IS_WINDOWS = sys.platform.startswith("win") or os.name == "nt"
@@ -184,10 +192,13 @@ class CableRobotGUI:
         self.motor_vars = [tk.DoubleVar(value=0.0) for _ in range(4)]
         self.max_limit_var = tk.DoubleVar(value=MAX_ANGLE_DEG)  # Max angle limit in degrees
 
-        # Visual Servoing & Pick-and-Place Managers
+        # Obstacle-Aided Continuum Retrieval & Vision Managers
+        self.obstacle_env = ObstacleEnvironment("Config 1: Dual-Peg S-Bend")
         self.color_detector = ColorDetector(min_contour_area=200)
         self.servo_controller = VisualServoController(self.robot, kp=0.0035, ki=0.0003, max_step_rad=0.08)
-        self.pick_manager = PickAndPlaceManager(self.robot, self.color_detector, self.servo_controller)
+        self.retriever = ObstacleAidedRetriever(self.robot, self.color_detector, self.servo_controller, self.obstacle_env)
+        self.pick_manager = self.retriever  # Backward compatible alias
+        self.obstacle_preset_var = tk.StringVar(value="Config 1: Dual-Peg S-Bend")
 
         self.active_target_color = tk.StringVar(value="")  # "red", "blue", "yellow", or ""
         self.is_servoing_active = False
@@ -384,7 +395,7 @@ class CableRobotGUI:
 
         self.right_notebook.add(tab_controls, text=" 🎯 Tension & D-Pad ")
         self.right_notebook.add(tab_camera, text=" 📷 RealSense Vision ")
-        self.right_notebook.add(tab_servoing, text=" 🤖 NUS Pick & Place ")
+        self.right_notebook.add(tab_servoing, text=" 🧲 Obstacle Retrieval ")
 
         self.create_slider_controls(left_frame)
         self.create_visualization_panel(tab_controls)
@@ -775,6 +786,21 @@ class CableRobotGUI:
         )
         btn_estop.pack(side=tk.LEFT)
 
+        # Cartesian XYZ Task-Space Control Button
+        btn_cartesian = tk.Button(
+            bottom_frame,
+            text="🕹️ Cartesian XYZ Control",
+            command=self.open_cartesian_controller,
+            bg="#0284c7",
+            fg="white",
+            relief=tk.FLAT,
+            padx=12,
+            pady=6,
+            font=(FONT_MAIN, 10, "bold"),
+            cursor="hand2",
+        )
+        btn_cartesian.pack(side=tk.LEFT, padx=10)
+
         # Safety Max Angle Limit
         limit_frame = tk.Frame(bottom_frame, bg=self.panel_bg)
         limit_frame.pack(side=tk.RIGHT)
@@ -799,6 +825,15 @@ class CableRobotGUI:
             font=(FONT_MAIN, 9),
         )
         limit_spin.pack(side=tk.LEFT, padx=3)
+
+    def open_cartesian_controller(self):
+        """Launches the dedicated Cartesian XYZ task-space controller."""
+        try:
+            import cartesian_controller as cc
+            win = tk.Toplevel(self.root)
+            cc.CartesianControlGUI(win, controller=self.robot)
+        except Exception as e:
+            messagebox.showerror("Cartesian Controller", f"Could not open Cartesian Controller: {e}")
 
     def create_camera_panel(self, parent):
         group = tk.LabelFrame(
@@ -1077,141 +1112,310 @@ class CableRobotGUI:
         self.lbl_servo_status.pack(fill=tk.X, pady=(1, 2))
 
     def create_servoing_panel(self, parent):
-        """Creates the dedicated NUS Pick & Place Trajectory Planning tab."""
+        """Creates the dedicated Obstacle-Aided Multi-Color Retrieval Controller tab."""
         group = tk.LabelFrame(
             parent,
-            text=" Autonomous NUS Pick & Place Trajectory Controller ",
+            text=" Obstacle-Aided Multi-Curvature Retrieval Controller ",
             font=(FONT_MAIN, 11, "bold"),
             fg=self.accent_color,
             bg=self.panel_bg,
-            padx=12,
-            pady=8,
+            padx=10,
+            pady=6,
         )
-        group.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        group.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
+        # Header description
         info_lbl = tk.Label(
             group,
-            text="Cubic 3D Bézier Splines + Quintic Minimum-Jerk Timing\n"
-                 "Closed-Loop Position-Based Visual Servoing (PBVS)",
+            text="Dual-Bend Obstacle Contact Actuation + Visual Servoing + Slot Stripping\n"
+                 "Targets: Red ('N') ➔ Blue ('U') ➔ Yellow ('S') | Green Magnetic Tip",
             font=(FONT_MAIN, 8),
             fg="#94a3b8",
             bg=self.panel_bg,
             justify=tk.LEFT,
         )
-        info_lbl.pack(anchor="w", pady=(0, 6))
+        info_lbl.pack(anchor="w", pady=(0, 4))
 
-        # NUS Targets Execution Bar
-        exec_frame = tk.LabelFrame(
+        # Row 1: Obstacle Configuration Preset Selector & Mission Benchmark
+        preset_frame = tk.Frame(group, bg=self.panel_bg)
+        preset_frame.pack(fill=tk.X, pady=(0, 4))
+
+        lbl_preset = tk.Label(
+            preset_frame,
+            text="Obstacle Config:",
+            font=(FONT_MAIN, 9, "bold"),
+            fg=self.text_color,
+            bg=self.panel_bg,
+        )
+        lbl_preset.pack(side=tk.LEFT, padx=(2, 4))
+
+        preset_combo = ttk.Combobox(
+            preset_frame,
+            textvariable=self.obstacle_preset_var,
+            values=[
+                "Config 1: Dual-Peg S-Bend",
+                "Config 2: Lateral Deflector",
+                "Config 3: Corridor",
+            ],
+            width=22,
+            font=(FONT_MAIN, 8),
+            state="readonly",
+        )
+        preset_combo.pack(side=tk.LEFT, padx=2)
+        preset_combo.bind("<<ComboboxSelected>>", self.on_change_obstacle_preset)
+
+        self.lbl_benchmark = tk.Label(
+            preset_frame,
+            text="Benchmark: <1m=3pts",
+            font=(FONT_MONO, 8, "bold"),
+            fg="#4ade80",
+            bg=self.panel_bg,
+        )
+        self.lbl_benchmark.pack(side=tk.RIGHT, padx=4)
+
+        # Row 2: 3-Target Status Dashboard Cards
+        cards_frame = tk.Frame(group, bg=self.panel_bg)
+        cards_frame.pack(fill=tk.X, pady=(0, 4))
+
+        # Target N Card
+        self.card_n = tk.Label(
+            cards_frame,
+            text="🔴 Target N (Red)\n[PENDING]",
+            font=(FONT_MAIN, 8, "bold"),
+            fg="white",
+            bg="#7f1d1d",
+            relief=tk.GROOVE,
+            padx=4,
+            pady=3,
+            width=14,
+        )
+        self.card_n.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+        # Target U Card
+        self.card_u = tk.Label(
+            cards_frame,
+            text="🔵 Target U (Blue)\n[PENDING]",
+            font=(FONT_MAIN, 8, "bold"),
+            fg="white",
+            bg="#1e3a8a",
+            relief=tk.GROOVE,
+            padx=4,
+            pady=3,
+            width=14,
+        )
+        self.card_u.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+        # Target S Card
+        self.card_s = tk.Label(
+            cards_frame,
+            text="🟡 Target S (Yellow)\n[PENDING]",
+            font=(FONT_MAIN, 8, "bold"),
+            fg="white",
+            bg="#78350f",
+            relief=tk.GROOVE,
+            padx=4,
+            pady=3,
+            width=14,
+        )
+        self.card_s.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+        # Row 3: Main Autonomous Action Bar
+        action_frame = tk.LabelFrame(
             group,
-            text=" One-Click Letter Routine Triggers ",
+            text=" Mission Execution ",
             font=(FONT_MAIN, 9, "bold"),
             fg="#38bdf8",
             bg=self.panel_bg,
-            padx=8,
-            pady=6,
-        )
-        exec_frame.pack(fill=tk.X, pady=(0, 6))
-
-        row1 = tk.Frame(exec_frame, bg=self.panel_bg)
-        row1.pack(fill=tk.X, pady=2)
-
-        btn_pick_n = tk.Button(
-            row1,
-            text="Pick & Slot 'N' (Red)",
-            command=lambda: self.execute_specific_pick_and_place("red"),
-            bg="#b91c1c",
-            fg="white",
-            relief=tk.FLAT,
-            font=(FONT_MAIN, 8, "bold"),
             padx=6,
             pady=4,
-            cursor="hand2",
         )
-        btn_pick_n.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        action_frame.pack(fill=tk.X, pady=(0, 4))
 
-        btn_pick_u = tk.Button(
-            row1,
-            text="Pick & Slot 'U' (Blue)",
-            command=lambda: self.execute_specific_pick_and_place("blue"),
-            bg="#1d4ed8",
-            fg="white",
-            relief=tk.FLAT,
-            font=(FONT_MAIN, 8, "bold"),
-            padx=6,
-            pady=4,
-            cursor="hand2",
-        )
-        btn_pick_u.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-
-        btn_pick_s = tk.Button(
-            row1,
-            text="Pick & Slot 'S' (Yellow)",
-            command=lambda: self.execute_specific_pick_and_place("yellow"),
-            bg="#b45309",
-            fg="white",
-            relief=tk.FLAT,
-            font=(FONT_MAIN, 8, "bold"),
-            padx=6,
-            pady=4,
-            cursor="hand2",
-        )
-        btn_pick_s.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-
-        btn_full_nus = tk.Button(
-            exec_frame,
-            text="★ Full Word Routine ('N' ➔ 'U' ➔ 'S')",
-            command=self.execute_full_nus_sequence,
+        # Big Button: Full 3-Target Sequence
+        self.btn_full_mission = tk.Button(
+            action_frame,
+            text="★ RUN FULL 3-TARGET OBSTACLE RETRIEVAL ('N' ➔ 'U' ➔ 'S')",
+            command=self.execute_full_obstacle_sequence,
             bg="#7209b7",
             fg="white",
             relief=tk.FLAT,
             font=(FONT_MAIN, 9, "bold"),
-            pady=5,
+            pady=4,
             cursor="hand2",
         )
-        btn_full_nus.pack(fill=tk.X, pady=(4, 2))
+        self.btn_full_mission.pack(fill=tk.X, pady=(0, 3))
 
-        # Parameter Tuning Frame
-        tune_frame = tk.LabelFrame(
-            group,
-            text=" Bézier & Servoing Parameters ",
-            font=(FONT_MAIN, 9, "bold"),
-            fg="#38bdf8",
-            bg=self.panel_bg,
-            padx=8,
-            pady=4,
+        # Single target retrieval buttons
+        singles_row = tk.Frame(action_frame, bg=self.panel_bg)
+        singles_row.pack(fill=tk.X)
+
+        btn_pick_n = tk.Button(
+            singles_row,
+            text="Retrieve 'N' (Red)",
+            command=lambda: self.execute_single_obstacle_retrieval("red"),
+            bg="#b91c1c",
+            fg="white",
+            relief=tk.FLAT,
+            font=(FONT_MAIN, 8, "bold"),
+            padx=3,
+            pady=3,
+            cursor="hand2",
         )
-        tune_frame.pack(fill=tk.X, pady=(0, 6))
+        btn_pick_n.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
 
-        tune_row = tk.Frame(tune_frame, bg=self.panel_bg)
-        tune_row.pack(fill=tk.X, pady=2)
+        btn_pick_u = tk.Button(
+            singles_row,
+            text="Retrieve 'U' (Blue)",
+            command=lambda: self.execute_single_obstacle_retrieval("blue"),
+            bg="#1d4ed8",
+            fg="white",
+            relief=tk.FLAT,
+            font=(FONT_MAIN, 8, "bold"),
+            padx=3,
+            pady=3,
+            cursor="hand2",
+        )
+        btn_pick_u.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
 
-        tk.Label(tune_row, text="Lift (mm):", bg=self.panel_bg, fg=self.text_color, font=(FONT_MAIN, 8)).pack(side=tk.LEFT)
-        self.lift_h_var = tk.DoubleVar(value=35.0)
-        tk.Spinbox(tune_row, from_=10.0, to=80.0, increment=5.0, textvariable=self.lift_h_var, width=4, font=(FONT_MAIN, 8)).pack(side=tk.LEFT, padx=2)
+        btn_pick_s = tk.Button(
+            singles_row,
+            text="Retrieve 'S' (Yellow)",
+            command=lambda: self.execute_single_obstacle_retrieval("yellow"),
+            bg="#b45309",
+            fg="white",
+            relief=tk.FLAT,
+            font=(FONT_MAIN, 8, "bold"),
+            padx=3,
+            pady=3,
+            cursor="hand2",
+        )
+        btn_pick_s.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
 
-        tk.Label(tune_row, text="Kp:", bg=self.panel_bg, fg=self.text_color, font=(FONT_MAIN, 8)).pack(side=tk.LEFT, padx=(4, 0))
-        self.kp_var = tk.DoubleVar(value=0.0035)
-        tk.Spinbox(tune_row, from_=0.001, to=0.010, increment=0.0005, textvariable=self.kp_var, width=5, font=(FONT_MAIN, 8), format="%.4f").pack(side=tk.LEFT, padx=2)
+        # Row 4: Step-by-Step Obstacle Workflow Verification
+        step_frame = tk.LabelFrame(
+            group,
+            text=" Step-by-Step Obstacle Workflow Testing ",
+            font=(FONT_MAIN, 8, "bold"),
+            fg="#94a3b8",
+            bg=self.panel_bg,
+            padx=4,
+            pady=2,
+        )
+        step_frame.pack(fill=tk.X, pady=(0, 4))
 
-        tk.Label(tune_row, text="Max Step:", bg=self.panel_bg, fg=self.text_color, font=(FONT_MAIN, 8)).pack(side=tk.LEFT, padx=(4, 0))
-        self.max_step_var = tk.DoubleVar(value=0.08)
-        tk.Spinbox(tune_row, from_=0.02, to=0.20, increment=0.02, textvariable=self.max_step_var, width=4, font=(FONT_MAIN, 8), format="%.2f").pack(side=tk.LEFT, padx=2)
+        step_row1 = tk.Frame(step_frame, bg=self.panel_bg)
+        step_row1.pack(fill=tk.X, pady=1)
 
-        # Log & Sequence readout
+        tk.Button(
+            step_row1,
+            text="1. Enter Obstacles",
+            command=self.step_enter_obstacles,
+            bg="#374151",
+            fg="white",
+            relief=tk.FLAT,
+            font=(FONT_MAIN, 7),
+            cursor="hand2",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+
+        tk.Button(
+            step_row1,
+            text="2. Dual-Bend Contact",
+            command=self.step_contact_bend,
+            bg="#374151",
+            fg="white",
+            relief=tk.FLAT,
+            font=(FONT_MAIN, 7),
+            cursor="hand2",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+
+        tk.Button(
+            step_row1,
+            text="3. Magnet Pickup",
+            command=self.step_magnet_pickup,
+            bg="#374151",
+            fg="white",
+            relief=tk.FLAT,
+            font=(FONT_MAIN, 7),
+            cursor="hand2",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+
+        step_row2 = tk.Frame(step_frame, bg=self.panel_bg)
+        step_row2.pack(fill=tk.X, pady=1)
+
+        tk.Button(
+            step_row2,
+            text="4. Withdraw Obstacles",
+            command=self.step_withdraw_obstacles,
+            bg="#374151",
+            fg="white",
+            relief=tk.FLAT,
+            font=(FONT_MAIN, 7),
+            cursor="hand2",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+
+        tk.Button(
+            step_row2,
+            text="5. Deliver to Slot",
+            command=self.step_deliver_slot,
+            bg="#374151",
+            fg="white",
+            relief=tk.FLAT,
+            font=(FONT_MAIN, 7),
+            cursor="hand2",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+
+        tk.Button(
+            step_row2,
+            text="6. Slot Detach Wipe",
+            command=self.step_slot_wipe,
+            bg="#374151",
+            fg="white",
+            relief=tk.FLAT,
+            font=(FONT_MAIN, 7),
+            cursor="hand2",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+
+        tk.Button(
+            step_row2,
+            text="7. Return to Obstacles",
+            command=self.step_return_obstacles,
+            bg="#374151",
+            fg="white",
+            relief=tk.FLAT,
+            font=(FONT_MAIN, 7),
+            cursor="hand2",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+
+        # Row 5: Launch 3D Continuum Simulator
+        sim3d_btn = tk.Button(
+            group,
+            text="🌐 Launch Interactive 3D Continuum Space Simulator",
+            command=self.launch_3d_simulator,
+            bg="#4338ca",
+            fg="white",
+            relief=tk.FLAT,
+            font=(FONT_MAIN, 9, "bold"),
+            padx=4,
+            pady=4,
+            cursor="hand2",
+        )
+        sim3d_btn.pack(fill=tk.X, pady=(3, 4))
+
+        # Row 6: Sequence Activity Log
         log_frame = tk.LabelFrame(
             group,
-            text=" Sequence Activity Log ",
-            font=(FONT_MAIN, 9, "bold"),
+            text=" Mission Activity Log & Diagnostics ",
+            font=(FONT_MAIN, 8, "bold"),
             fg="#38bdf8",
             bg=self.panel_bg,
-            padx=6,
-            pady=4,
+            padx=4,
+            pady=2,
         )
         log_frame.pack(fill=tk.BOTH, expand=True)
 
         self.seq_log_text = tk.Text(
             log_frame,
-            height=7,
+            height=6,
             bg="#111217",
             fg="#4ade80",
             font=(FONT_MONO, 8),
@@ -1219,7 +1423,7 @@ class CableRobotGUI:
             wrap=tk.WORD,
         )
         self.seq_log_text.pack(fill=tk.BOTH, expand=True)
-        self.log_seq_message("System ready. Select target color or run full NUS sequence.")
+        self.log_seq_message("Obstacle-aided continuum retrieval ready. Select config or click Run Full Sequence.")
 
     # -------------------------------------------------------------
     # Action Handlers
@@ -1437,15 +1641,19 @@ class CableRobotGUI:
                     err_dist = math.hypot(tx - tip_pos[0], ty - tip_pos[1])
                 self.latest_err_dist = err_dist
 
-                # Render rich HUD overlay with Bézier curve onto bgr
-                state_str = "SERVOING" if self.is_servoing_active else ("LOCKED" if target_col else "IDLE")
+                # Render rich HUD overlay with Obstacles, Slots, Bézier curve onto bgr
+                m_time = (time.time() - self.retriever.mission_start_time) if getattr(self.retriever, "mission_start_time", None) else None
+                active_state = self.retriever.current_state if getattr(self.retriever, "is_running", False) else state_str
                 annotated = self.color_detector.draw_hud(
                     bgr,
                     self.latest_detections,
-                    target_color=target_col if target_col else None,
+                    target_color=self.retriever.active_color or (target_col if target_col else None),
                     tip_pos=tip_pos,
                     error_dist=err_dist,
-                    state_text=state_str,
+                    state_text=active_state,
+                    obstacle_env=self.obstacle_env,
+                    target_statuses=self.retriever.target_statuses,
+                    mission_time=m_time,
                 )
 
                 rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
@@ -1593,15 +1801,38 @@ class CableRobotGUI:
         if not target_col:
             messagebox.showinfo("Target Color", "Please select a target color (Red, Blue, or Yellow) first.")
             return
-        self.execute_specific_pick_and_place(target_col)
+        self.execute_single_obstacle_retrieval(target_col)
 
-    def execute_specific_pick_and_place(self, color_name):
-        """Runs autonomous pick and place routine in background thread."""
-        if self.is_moving_thread or self.pick_manager.is_running:
+    def on_change_obstacle_preset(self, event=None):
+        """Switches active obstacle geometry preset."""
+        preset = self.obstacle_preset_var.get()
+        self.obstacle_env.configure_preset(preset)
+        self.log_seq_message(f"Switched obstacle preset to: {preset}")
+
+    def update_target_cards(self):
+        """Updates GUI target status dashboard cards."""
+        statuses = getattr(self.retriever, "target_statuses", {})
+
+        def _style(card, color_name, letter_name, bg_norm, bg_act, bg_done):
+            st = statuses.get(color_name, "PENDING")
+            if st == "SLOTTED":
+                card.config(text=f"✓ Target {letter_name} ({color_name.capitalize()})\n[SLOTTED]", bg=bg_done)
+            elif st == "ACTIVE":
+                card.config(text=f"▶ Target {letter_name} ({color_name.capitalize()})\n[RETRIEVING...]", bg=bg_act)
+            else:
+                card.config(text=f"○ Target {letter_name} ({color_name.capitalize()})\n[PENDING]", bg=bg_norm)
+
+        if hasattr(self, "card_n"):
+            _style(self.card_n, "red", "N", "#7f1d1d", "#dc2626", "#15803d")
+            _style(self.card_u, "blue", "U", "#1e3a8a", "#2563eb", "#15803d")
+            _style(self.card_s, "yellow", "S", "#78350f", "#d97706", "#15803d")
+
+    def execute_single_obstacle_retrieval(self, color_name):
+        """Runs autonomous obstacle retrieval for a single target letter."""
+        if self.is_moving_thread or self.retriever.is_running:
             messagebox.showinfo("Busy", "A routine is already running.")
             return
 
-        # Switch to Servoing tab
         try:
             self.right_notebook.select(2)
         except Exception:
@@ -1609,40 +1840,155 @@ class CableRobotGUI:
 
         def _runner():
             self.is_moving_thread = True
-            self.pick_manager.servo.kp = self.kp_var.get()
-            self.pick_manager.servo.max_step_rad = self.max_step_var.get()
-            self.pick_manager.execute_pick_and_place(
-                color_name,
-                progress_callback=lambda st, msg: self.root.after(0, lambda: self.log_seq_message(f"[{st}] {msg}")),
-            )
-            self.is_moving_thread = False
+            letter = self.obstacle_env.color_to_letter.get(color_name, "?")
+            self.log_seq_message(f"=== Starting Obstacle-Aided Retrieval for '{letter}' ({color_name.upper()}) ===")
+
+            orig_send = self.robot.send_angles
+            def sync_send(angles, *args, **kwargs):
+                orig_send(angles, *args, **kwargs)
+                for idx, rad in enumerate(angles):
+                    deg = math.degrees(rad)
+                    self.motor_vars[idx].set(max(0.0, min(self.max_limit_var.get(), deg)))
+                    self.val_labels[idx].config(text=f"{deg:5.1f}° ({rad:.2f} rad)")
+                self.draw_canvas_visualizer()
+            self.robot.send_angles = sync_send
+
+            try:
+                self.retriever.retrieve_single_target(
+                    color_name,
+                    progress_callback=lambda st, msg: self.root.after(0, lambda: (self.log_seq_message(f"[{st}] {msg}"), self.update_target_cards())),
+                )
+            finally:
+                self.robot.send_angles = orig_send
+                self.is_moving_thread = False
+                self.root.after(0, self.update_target_cards)
 
         threading.Thread(target=_runner, daemon=True).start()
 
-    def execute_full_nus_sequence(self):
-        """Runs the entire NUS word sequence: Pick & place N, then U, then S."""
-        if self.is_moving_thread or self.pick_manager.is_running:
+    def execute_full_obstacle_sequence(self):
+        """Runs the complete 3-target sequence: Red ('N') ➔ Blue ('U') ➔ Yellow ('S')."""
+        if self.is_moving_thread or self.retriever.is_running:
             messagebox.showinfo("Busy", "A routine is already running.")
             return
 
+        try:
+            self.right_notebook.select(2)
+        except Exception:
+            pass
+
         def _full_runner():
             self.is_moving_thread = True
-            for letter_color in ["red", "blue", "yellow"]:
-                self.log_seq_message(f"=== Starting Sequence for '{self.pick_manager.color_to_letter[letter_color]}' ===")
-                self.pick_manager.execute_pick_and_place(
-                    letter_color,
-                    progress_callback=lambda st, msg: self.root.after(0, lambda: self.log_seq_message(f"[{st}] {msg}")),
+            self.btn_full_mission.config(state=tk.DISABLED, bg="#4b5563")
+
+            orig_send = self.robot.send_angles
+            def sync_send(angles, *args, **kwargs):
+                orig_send(angles, *args, **kwargs)
+                for idx, rad in enumerate(angles):
+                    deg = math.degrees(rad)
+                    self.motor_vars[idx].set(max(0.0, min(self.max_limit_var.get(), deg)))
+                    self.val_labels[idx].config(text=f"{deg:5.1f}° ({rad:.2f} rad)")
+                self.draw_canvas_visualizer()
+            self.robot.send_angles = sync_send
+
+            try:
+                self.retriever.run_full_3target_sequence(
+                    order=["red", "blue", "yellow"],
+                    progress_callback=lambda st, msg: self.root.after(0, lambda: (self.log_seq_message(f"[{st}] {msg}"), self.update_target_cards())),
                 )
-                time.sleep(1.0)
-            self.log_seq_message("🎉 Full NUS Sequence Completed Successfully!")
-            self.is_moving_thread = False
+            finally:
+                self.robot.send_angles = orig_send
+                self.is_moving_thread = False
+                self.root.after(0, lambda: (self.btn_full_mission.config(state=tk.NORMAL, bg="#7209b7"), self.update_target_cards()))
 
         threading.Thread(target=_full_runner, daemon=True).start()
+
+    # -------------------------------------------------------------
+    # Step-by-Step Testing & Verification Handlers
+    # -------------------------------------------------------------
+
+    def run_step_action(self, name, action_func):
+        if self.is_moving_thread or self.retriever.is_running:
+            messagebox.showinfo("Busy", "A routine is already running.")
+            return
+
+        def _step_worker():
+            self.is_moving_thread = True
+            self.log_seq_message(f"Starting test step: {name}")
+            try:
+                action_func()
+                self.log_seq_message(f"[OK] Completed test step: {name}")
+            except Exception as e:
+                self.log_seq_message(f"[ERROR] Step {name} failed: {e}")
+            finally:
+                self.is_moving_thread = False
+
+        threading.Thread(target=_step_worker, daemon=True).start()
+
+    def step_enter_obstacles(self):
+        """Step 1: Move from home to obstacle arena entrance."""
+        self.run_step_action("1. Enter Obstacles", lambda: self.robot.move_smooth(self.obstacle_env.entry_pose, duration=1.2))
+
+    def step_contact_bend(self):
+        """Step 2: Actuate cables to establish obstacle contact and form dual bend."""
+        target_col = self.active_target_color.get() or "red"
+        pose = self.obstacle_env.contact_poses.get(target_col, [0.55, 0.15, 0.40, 0.0])
+        self.run_step_action(f"2. Dual-Bend Contact ({target_col.upper()})", lambda: self.robot.move_smooth(pose, duration=1.6))
+
+    def step_magnet_pickup(self):
+        """Step 3: Lower tip into magnetic contact with letter."""
+        curr = list(self.robot.current_angles)
+        press = [a * 1.05 for a in curr]
+        lift = [a * 0.90 for a in curr]
+        def _action():
+            self.robot.move_smooth(press, duration=0.6)
+            time.sleep(0.5)
+            self.robot.move_smooth(lift, duration=0.8)
+        self.run_step_action("3. Magnet Pickup", _action)
+
+    def step_withdraw_obstacles(self):
+        """Step 4: Unwind bends and safely come out of obstacle field."""
+        target_col = self.active_target_color.get() or "red"
+        wps = self.obstacle_env.withdrawal_paths.get(target_col, [self.obstacle_env.entry_pose, [0.0]*4])
+        def _action():
+            for wp in wps:
+                self.robot.move_smooth(wp, duration=0.9)
+                time.sleep(0.15)
+        self.run_step_action("4. Withdraw Obstacles", _action)
+
+    def step_deliver_slot(self):
+        """Step 5: Transfer letter to designated drop slot."""
+        target_col = self.active_target_color.get() or "red"
+        pose = self.obstacle_env.slot_delivery_poses.get(target_col, [0.0, 0.0, 0.2, 0.4])
+        self.run_step_action(f"5. Deliver to Slot ({target_col.upper()})", lambda: self.robot.move_smooth(pose, duration=1.4))
+
+    def step_slot_wipe(self):
+        """Step 6: Execute shear wipe against slot lip to strip magnet."""
+        target_col = self.active_target_color.get() or "red"
+        delivery_pose = self.obstacle_env.slot_delivery_poses.get(target_col, [0.0, 0.0, 0.2, 0.4])
+        delta = self.obstacle_env.slot_wipe_deltas.get(target_col, [0.10, 0.0, -0.10, 0.15])
+        wipe_pose = [delivery_pose[i] + delta[i] for i in range(4)]
+        clear_pose = [a * 0.5 for a in wipe_pose]
+        def _action():
+            self.robot.move_smooth(wipe_pose, duration=0.8)
+            time.sleep(0.3)
+            self.robot.move_smooth(clear_pose, duration=0.7)
+        self.run_step_action("6. Slot Detach Wipe", _action)
+
+    def step_return_obstacles(self):
+        """Step 7: Return from slot to obstacle entrance staging pose."""
+        self.run_step_action("7. Return to Obstacles", lambda: self.robot.move_smooth(self.obstacle_env.entry_pose, duration=1.2))
+
+    # Aliases for backward compatibility
+    def execute_specific_pick_and_place(self, color_name):
+        self.execute_single_obstacle_retrieval(color_name)
+
+    def execute_full_nus_sequence(self):
+        self.execute_full_obstacle_sequence()
 
     def stop_all_autonomous_actions(self):
         """Emergency stop for all autonomous vision and servoing actions."""
         self.stop_servoing()
-        self.pick_manager.stop()
+        self.retriever.stop()
 
     def log_seq_message(self, msg):
         """Appends timestamped message to the activity log."""
@@ -1650,6 +1996,16 @@ class CableRobotGUI:
             t_str = time.strftime("%H:%M:%S")
             self.seq_log_text.insert(tk.END, f"[{t_str}] {msg}\n")
             self.seq_log_text.see(tk.END)
+
+    def launch_3d_simulator(self):
+        """Launches the interactive 3D continuum simulator in an external process."""
+        import subprocess
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        sim_script = os.path.join(base_dir, "simulation", "simulate_obstacle_retrieval.py")
+        if not os.path.exists(sim_script):
+            sim_script = os.path.join(base_dir, "simulate_obstacle_retrieval.py")
+        subprocess.Popen([sys.executable, sim_script])
+        self.log_seq_message("Launched Interactive 3D Continuum Simulator in external window.")
 
 
     def on_toggle_track_markers(self):

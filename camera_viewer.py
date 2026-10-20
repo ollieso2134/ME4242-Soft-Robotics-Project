@@ -65,23 +65,29 @@ def main():
     )
     args = parser.parse_args()
 
-    cameras = EmioCamera.listCameras()
+    from visual_servoing import ColorDetector, ObstacleEnvironment, SimulatedObstacleCamera
+    obs_env = ObstacleEnvironment()
+
+    cameras = EmioCamera.listCameras() if HAS_EMIO_CAMERA else []
     if not cameras:
-        print("[FAIL] No Intel RealSense camera detected. Is it plugged into a USB 3.0 port?")
-        return
+        print("[INFO] No physical RealSense camera detected.")
+        print("[INFO] Starting Simulated Obstacle Camera with Dual-Bend Obstacle Course & Letter Targets.")
+        from cabledriven import CableDrivenRobotController
+        mock_robot = CableDrivenRobotController()
+        cam = SimulatedObstacleCamera(mock_robot, obs_env)
+    else:
+        serial = args.serial or cameras[0]
+        print(f"[INFO] Connecting to RealSense camera: {serial}")
 
-    serial = args.serial or cameras[0]
-    print(f"[INFO] Connecting to RealSense camera: {serial}")
+        cam = EmioCamera(
+            camera_serial=serial,
+            track_markers=args.track,
+            show=False,
+        )
 
-    cam = EmioCamera(
-        camera_serial=serial,
-        track_markers=args.track,
-        show=False,
-    )
-
-    if not cam.open(serial):
-        print(f"[FAIL] Could not open camera {serial}.")
-        return
+        if not cam.open(serial):
+            print(f"[FAIL] Could not open camera {serial}.")
+            return
 
     detector = ColorDetector(min_contour_area=200)
     target_color = args.target
@@ -143,6 +149,7 @@ def main():
                 tip_pos=tip_pos,
                 error_dist=err_dist,
                 state_text=state_msg,
+                obstacle_env=obs_env,
             )
 
             if depth_view and cam.depth_frame is not None:

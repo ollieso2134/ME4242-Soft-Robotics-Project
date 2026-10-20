@@ -58,41 +58,48 @@ class CableDrivenRobotController:
         self.camera_serial = None
         self.last_connection_error = None
 
-    def connect_camera(self, camera_serial=None, track_markers=False):
+    def connect_camera(self, camera_serial=None, track_markers=False, allow_simulation_fallback=True):
         """
-        Connect to Intel RealSense D405 depth camera via emioapi.
+        Connect to Intel RealSense D405 depth camera via emioapi,
+        or fallback to SimulatedObstacleCamera if no hardware camera is plugged in.
         
         :param camera_serial: Camera serial number (str). If None, auto-selects first detected camera.
         :param track_markers: Enable automatic soft robot marker tracking.
+        :param allow_simulation_fallback: Fall back to high-fidelity simulation camera if no hardware is detected.
         :return: (bool success, str message)
         """
-        if not HAS_EMIO_API:
-            return False, "emioapi is not installed."
+        if self.camera is not None:
+            try:
+                self.camera.close()
+            except Exception:
+                pass
 
-        try:
-            from emioapi import EmioCamera
-            cameras = EmioCamera.listCameras()
-            target_serial = camera_serial or (cameras[0] if cameras else None)
-            if not target_serial:
-                return False, "No RealSense camera detected. Is it plugged in?"
+        if HAS_EMIO_API:
+            try:
+                from emioapi import EmioCamera
+                cameras = EmioCamera.listCameras()
+                target_serial = camera_serial or (cameras[0] if cameras else None)
+                if target_serial:
+                    cam = EmioCamera(camera_serial=target_serial, track_markers=track_markers, show=False)
+                    if cam.open(target_serial):
+                        self.camera = cam
+                        self.camera_serial = target_serial
+                        print(f"[INFO] Successfully connected to RealSense Camera: {target_serial}")
+                        return True, f"Connected to RealSense ({target_serial})"
+            except Exception as e:
+                print(f"[WARN] Error connecting to physical RealSense camera: {e}")
 
-            if self.camera is not None:
-                try:
-                    self.camera.close()
-                except Exception:
-                    pass
+        if allow_simulation_fallback:
+            try:
+                from visual_servoing import SimulatedObstacleCamera
+                self.camera = SimulatedObstacleCamera(self)
+                self.camera_serial = "SIM_D405"
+                print("[INFO] No hardware camera found. Connected to Simulated Obstacle Camera (Dual-Bend Obstacles Active).")
+                return True, "Connected to Simulation Camera (Obstacles Active)"
+            except Exception as e:
+                return False, f"Simulation camera error: {e}"
 
-            cam = EmioCamera(camera_serial=target_serial, track_markers=track_markers, show=False)
-            if not cam.open(target_serial):
-                return False, f"Failed to open RealSense camera {target_serial}"
-
-            self.camera = cam
-            self.camera_serial = target_serial
-            print(f"[INFO] Successfully connected to RealSense Camera: {target_serial}")
-            return True, f"Connected to RealSense ({target_serial})"
-        except Exception as e:
-            print(f"[WARN] Error connecting to camera: {e}")
-            return False, str(e)
+        return False, "No RealSense camera detected. Is it plugged in?"
 
     def disconnect_camera(self):
         """Disconnect and release the RealSense camera."""
