@@ -32,6 +32,9 @@ except ImportError as e:
 
 from visual_servoing import ColorDetector
 
+WINDOW_NAME = "EMIO RealSense - Red/Blue/Yellow Bezier Visual Servoing"
+
+
 def apply_rotation(img, mode):
     if img is None:
         return None
@@ -111,6 +114,8 @@ def main():
     rotation_mode = args.rotate
     rotations = ["90_ccw", "180", "90_cw", "0"]
 
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+
     try:
         while True:
             cam.update()
@@ -160,7 +165,7 @@ def main():
             else:
                 display = annotated
 
-            cv2.imshow("EMIO RealSense - Red/Blue/Yellow Bézier Visual Servoing", display)
+            cv2.imshow(WINDOW_NAME, display)
             key = cv2.waitKey(1) & 0xFF
 
             if key in [ord('q'), 27]:  # q or ESC
