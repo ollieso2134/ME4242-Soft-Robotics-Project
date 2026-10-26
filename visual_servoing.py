@@ -57,11 +57,11 @@ class ColorDetector:
             "label": "Target S (Yellow)",
             "letter": "S",
         },
-        "green": {
-            "lower": np.array([40, 80, 60]),
-            "upper": np.array([85, 255, 255]),
-            "display_color": (60, 225, 60),  # BGR
-            "label": "Arm Tip (Green)",
+        "orange": {
+            "lower": np.array([11, 120, 90]),
+            "upper": np.array([17, 255, 255]),
+            "display_color": (0, 140, 255),  # BGR (orange)
+            "label": "Arm Tip (Orange)",
             "letter": "TIP",
         },
     }
@@ -133,7 +133,7 @@ class ColorDetector:
     def detect_all_targets(self, frame_bgr):
         """Detects all objects: Red (N), Blue (U), Yellow (S), and Green (Tip)."""
         results = {}
-        for c in ["red", "blue", "yellow", "green"]:
+        for c in ["red", "blue", "yellow", "orange"]:
             det = self.detect_single(frame_bgr, c)
             if det:
                 results[c] = det
@@ -290,7 +290,7 @@ class ColorDetector:
             bx, by, bw, bh = det["bbox"]
             disp_col = det["display_color"]
 
-            if col == "green" and detected_tip is None:
+            if col == "orange" and detected_tip is None:
                 detected_tip = (cx, cy)
 
             if col == target_color:
@@ -328,10 +328,10 @@ class ColorDetector:
 
         # 4. Draw Green Tip
         if detected_tip is not None:
-            cv2.circle(annotated, (int(detected_tip[0]), int(detected_tip[1])), 9, (0, 255, 0), 2)
-            cv2.circle(annotated, (int(detected_tip[0]), int(detected_tip[1])), 3, (0, 255, 0), -1)
-            cv2.putText(annotated, "GREEN MAGNET TIP", (int(detected_tip[0]) + 12, int(detected_tip[1]) - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.circle(annotated, (int(detected_tip[0]), int(detected_tip[1])), 9, (0, 140, 255), 2)
+            cv2.circle(annotated, (int(detected_tip[0]), int(detected_tip[1])), 3, (0, 140, 255), -1)
+            cv2.putText(annotated, "ORANGE MAGNET TIP", (int(detected_tip[0]) + 12, int(detected_tip[1]) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 140, 255), 1, cv2.LINE_AA)
 
         # 5. Draw Trajectory Path Curve
         if target_color and target_centroid and detected_tip:
@@ -780,7 +780,7 @@ class ObstacleAidedRetriever:
                     return False
                 frame = self.get_latest_rotated_frame()
                 if frame is not None:
-                    tip_det = self.detector.detect_single(frame, "green")
+                    tip_det = self.detector.detect_single(frame, "orange")
                     tgt_det = self.detector.detect_single(frame, target_color)
 
                     if tgt_det:
@@ -1138,10 +1138,10 @@ class SimulatedObstacleCamera:
                 cv2.circle(img, p1, thickness // 2 + 3, (85, 90, 102), -1)  # Dark metallic spacer ring
                 cv2.circle(img, p1, thickness // 2 + 3, (200, 205, 215), 1)
 
-        # Render Green Magnetic Tip Marker
-        cv2.circle(img, tip_raw, 11, (50, 220, 50), -1)
+        # Render Orange Magnetic Tip Marker
+        cv2.circle(img, tip_raw, 11, (0, 140, 255), -1)
         cv2.circle(img, tip_raw, 11, (255, 255, 255), 2)
-        cv2.circle(img, tip_raw, 4, (30, 160, 30), -1)
+        cv2.circle(img, tip_raw, 4, (0, 110, 230), -1)
 
         # Update attached letter position
         if self.attached_letter is not None:

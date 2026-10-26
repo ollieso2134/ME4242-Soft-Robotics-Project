@@ -127,14 +127,14 @@ def main():
             # Apply 90° CCW rotation
             display_frame = apply_rotation(frame.copy(), rotation_mode)
 
-            # Detect Red, Blue, Yellow, and Green markers
+            # Detect Red, Blue, Yellow, and Orange tip markers
             detections = detector.detect_all_targets(display_frame)
 
             # Calculate error if target and tip are present
             err_dist = None
             tip_pos = None
-            if "green" in detections:
-                tip_pos = detections["green"]["centroid"]
+            if "orange" in detections:
+                tip_pos = detections["orange"]["centroid"]
             elif cam.trackers_pos:
                 # Use first EMIO tracker if available
                 tip_pos = (display_frame.shape[1] // 2, int(display_frame.shape[0] * 0.45))

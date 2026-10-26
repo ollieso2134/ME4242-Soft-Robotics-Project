@@ -1626,8 +1626,8 @@ class CableRobotGUI:
                 self.latest_detections = self.color_detector.detect_all_targets(bgr)
 
                 tip_pos = None
-                if "green" in self.latest_detections:
-                    tip_pos = self.latest_detections["green"]["centroid"]
+                if "orange" in self.latest_detections:
+                    tip_pos = self.latest_detections["orange"]["centroid"]
                 elif getattr(self.robot.camera, "trackers_pos", []):
                     tip_pos = (bgr.shape[1] // 2, int(bgr.shape[0] * 0.45))
                 else:
@@ -1680,8 +1680,8 @@ class CableRobotGUI:
                         text=f"Target: {tdet['label']} ({tcx}, {tcy}) {z_str} | Err: {err_dist:.1f}px",
                         fg=self.accent_color,
                     )
-                elif "green" in self.latest_detections:
-                    gx, gy = self.latest_detections["green"]["centroid"]
+                elif "orange" in self.latest_detections:
+                    gx, gy = self.latest_detections["orange"]["centroid"]
                     self.lbl_marker_pos.config(text=f"Arm Tip: ({gx}, {gy}) | Standby for Target", fg=self.green_color)
                 else:
                     trackers = getattr(self.robot.camera, "trackers_pos", [])

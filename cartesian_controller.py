@@ -43,7 +43,7 @@ if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 
 try:
-    from cabledriven import CableDrivenRobotController, list_serial_ports, MAX_ANGLE_DEG
+    from cabledriven import CableDrivenRobotController, MAX_ANGLE_DEG
 except ImportError:
     # Minimal fallback controller if cabledriven is missing
     MAX_ANGLE_DEG = 180.0
