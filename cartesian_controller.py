@@ -46,7 +46,7 @@ try:
     from cabledriven import CableDrivenRobotController, MAX_ANGLE_DEG
 except ImportError:
     # Minimal fallback controller if cabledriven is missing
-    MAX_ANGLE_DEG = 180.0
+    MAX_ANGLE_DEG = 360.0
     def list_serial_ports(): return []
     class CableDrivenRobotController:
         def __init__(self, **kwargs):

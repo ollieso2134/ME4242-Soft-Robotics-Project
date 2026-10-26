@@ -32,9 +32,8 @@ except Exception:
     EmioAPI = None
 
 
-# Software limit for motor angles. The motors themselves allow about +/-180 deg;
-# how far the cables and soft body can safely go depends on the build.
-MAX_ANGLE_DEG = 180.0
+# Software limit for motor angles. Defaulting to 360.0 deg (multi-turn rotation).
+MAX_ANGLE_DEG = 360.0
 
 
 class CableDrivenRobotController:
@@ -43,7 +42,7 @@ class CableDrivenRobotController:
         Initialize the cable-driven robot controller.
         
         :param min_angle: Minimum safe motor angle in radians (typically 0.0, cable fully released/slack)
-        :param max_angle: Maximum safe motor angle in radians (default pi = 180 deg, the motor travel limit)
+        :param max_angle: Maximum safe motor angle in radians (default 2*pi = 360 deg)
         :param num_motors: Number of actuation cables/motors (standard EMIO has 4)
         """
         self.min_angle = min_angle
@@ -150,8 +149,29 @@ class CableDrivenRobotController:
                 self.emio = emio
                 self.port = target_port
 
-                # Start interpolating from where the motors really are, not from 0.
-                self.current_angles = [float(a) for a in emio.motors.angles]
+                # Enable Extended Position Mode (Mode 4) on all motors for multi-turn (> 180 deg) rotation
+                try:
+                    mg = emio.motors._mg
+                    params = mg.parameters
+                    for dxl_id in params.DXL_IDs:
+                        mg.packetHandler.write1ByteTxRx(mg.portHandler, dxl_id, params.ADDR_TORQUE_ENABLE, 0)
+                    mg.setOperatingMode(4)
+                    mg.enableTorque()
+                    print("[INFO] Extended Position Mode (Mode 4) enabled: motors can rotate past 180° up to 360°.")
+                except Exception as e:
+                    print(f"[WARN] Could not enable Extended Position Mode: {e}")
+
+                # Start interpolating from where the motors really are, with signed 32-bit pulse decoding.
+                try:
+                    pulses = emio.motors._mg.getCurrentPosition()
+                    if pulses:
+                        signed_pulses = [(p - 0x100000000 if p >= 0x80000000 else p) for p in pulses]
+                        self.current_angles = [float(emio.motors.pulseToRad([p])[0]) for p in signed_pulses]
+                    else:
+                        self.current_angles = [float(a) for a in emio.motors.angles]
+                except Exception:
+                    self.current_angles = [float(a) for a in emio.motors.angles]
+
                 self.is_connected = True
                 self.is_mock = False
                 self.last_connection_error = None

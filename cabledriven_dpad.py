@@ -8,16 +8,16 @@ Motors: M1 (+X), M2 (+Y), M3 (-X), M4 (-Y).
     Front = M1+M2    Left = M2+M3    Back = M3+M4    Right = M4+M1
 
 Each active button contracts its two motors (+angle) and relaxes the other two
-(-angle), where angle is set in the input field (default 90 deg, max 180) and takes
+(0 deg), where angle is set in the input field (default 90 deg, max 180) and takes
 effect on Apply / Enter. Contributions of active buttons are summed and clamped to
-+/-angle, so two adjacent buttons give a diagonal: Front+Left -> M2 +angle, M4 -angle,
-M1/M3 at 0.
+0..angle, so two adjacent buttons give a diagonal: Front+Left -> M2 +angle,
+M1/M3/M4 at 0.
 Pressing a button toggles it and disengages its opposite (Front<->Back, Left<->Right).
 Angles ramp linearly toward the target.
 
 A second, unrotated D-pad (same layout as cabledriven_gui.py) drives one motor per button:
     +Y = M2    -X = M3    +X = M1    -Y = M4
-It toggles the same way (the opposite button disengages, the opposite motor is relaxed).
+It toggles the same way (the opposite button disengages, the opposite motor is relaxed to 0 deg).
 Pressing a button on one pad disengages every active button on the other pad.
 """
 
@@ -60,7 +60,7 @@ class ToggleDPad:
         root.title("Cable-Driven Toggle D-Pad")
 
         limit = math.radians(MAX_ANGLE_DEG)
-        self.robot = CableDrivenRobotController(min_angle=-limit, max_angle=limit, num_motors=4)
+        self.robot = CableDrivenRobotController(min_angle=0.0, max_angle=limit, num_motors=4)
         self.robot.connect(port)
         self.angles = [0.0] * 4
         self.amplitude = 90.0
@@ -120,7 +120,7 @@ class ToggleDPad:
         net_x = net_y = 0.0
         for (dx, dy, label, color), deg in zip(ANCHORS, self.angles):
             ax, ay = cx + dx, cy + dy
-            norm = deg / MAX_ANGLE_DEG  # -1 (relaxed) .. +1 (contracted)
+            norm = deg / MAX_ANGLE_DEG  # 0 (relaxed) .. +1 (contracted)
             c.create_oval(ax - 7, ay - 7, ax + 7, ay + 7, fill=color, outline="")
             c.create_text(ax, ay + (14 if dy > 0 else -14), text=label, fill=color, font=("TkDefaultFont", 7))
             if norm > 0.01:
@@ -166,7 +166,7 @@ class ToggleDPad:
             for m in motors:
                 t[m] += self.amplitude
                 t[(m + 2) % 4] -= self.amplitude
-        return [max(-self.amplitude, min(self.amplitude, v)) for v in t]
+        return [max(0.0, min(self.amplitude, v)) for v in t]
 
     def tick(self):
         max_step = SPEED_DEG_PER_S * TICK_MS / 1000.0

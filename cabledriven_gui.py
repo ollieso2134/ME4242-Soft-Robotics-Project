@@ -33,7 +33,7 @@ try:
 except ImportError:
     # Fallback minimal import if moved
     HAS_EMIO_API = False
-    MAX_ANGLE_DEG = 180.0
+    MAX_ANGLE_DEG = 360.0
     class CableDrivenRobotController:
         def __init__(self, **kwargs):
             self.current_angles = [0.0] * 4
@@ -209,6 +209,18 @@ class CableRobotGUI:
         self.latest_tip_pos = None
         self.latest_err_dist = None
         self.target_btn_widgets = {}
+
+        # Manual Trajectory Recorder & Replay state
+        self.is_recording = False
+        self.is_replaying = False
+        self.recorded_trajectory = []
+        self.record_start_time = 0.0
+        self.record_timer_id = None
+        self.replay_stop_event = threading.Event()
+        self.replay_loop_var = tk.BooleanVar(value=False)
+        self.replay_speed_var = tk.StringVar(value="1.0x")
+        self.trajectory_status_var = tk.StringVar(value="Ready • No trajectory recorded")
+        self.rec_btn_widgets = {}
 
         self.setup_ui()
         self.connect_hardware(port=self.port_var.get())
@@ -398,6 +410,7 @@ class CableRobotGUI:
         self.right_notebook.add(tab_servoing, text=" 🧲 Obstacle Retrieval ")
 
         self.create_slider_controls(left_frame)
+        self.create_trajectory_recorder_panel(left_frame)
         self.create_visualization_panel(tab_controls)
         self.create_dpad_panel(tab_controls)
         self.create_camera_panel(tab_camera)
@@ -565,28 +578,32 @@ class CableRobotGUI:
         cx, cy = self.canvas_size // 2, self.canvas_size // 2
         r_outer = 80
         r_inner = 15
+        d = int(round(r_outer * math.sqrt(0.5)))
 
-        # Background reference rings
+        # Background reference rings & 45° diagonal motor axes
         self.canvas.create_oval(cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer, outline="#333", width=2)
         self.canvas.create_oval(cx - r_outer//2, cy - r_outer//2, cx + r_outer//2, cy + r_outer//2, outline="#222", width=1, dash=(2, 2))
-        self.canvas.create_line(cx - r_outer - 10, cy, cx + r_outer + 10, cy, fill="#2c2c34", dash=(2, 2))
-        self.canvas.create_line(cx, cy - r_outer - 10, cx, cy + r_outer + 10, fill="#2c2c34", dash=(2, 2))
+        self.canvas.create_line(cx - r_outer - 10, cy, cx + r_outer + 10, cy, fill="#1c1c24", dash=(2, 2))
+        self.canvas.create_line(cx, cy - r_outer - 10, cx, cy + r_outer + 10, fill="#1c1c24", dash=(2, 2))
+        self.canvas.create_line(cx - d - 8, cy - d - 8, cx + d + 8, cy + d + 8, fill="#2c2c34", dash=(2, 2))
+        self.canvas.create_line(cx - d - 8, cy + d + 8, cx + d + 8, cy - d - 8, fill="#2c2c34", dash=(2, 2))
 
-        # Cable anchor positions (4 quadrants)
-        # M1 (+X), M2 (+Y), M3 (-X), M4 (-Y) in Cartesian (note canvas Y is inverted)
+        # Cable anchor positions rotated 45° CW:
+        # M1 (+X) -> Bottom-Right, M2 (+Y) -> Top-Right, M3 (-X) -> Top-Left, M4 (-Y) -> Bottom-Left
         anchors = [
-            (cx + r_outer, cy, "M1 (+X)", "#38bdf8"),
-            (cx, cy - r_outer, "M2 (+Y)", "#a855f7"),
-            (cx - r_outer, cy, "M3 (-X)", "#f97316"),
-            (cx, cy + r_outer, "M4 (-Y)", "#10b981"),
+            (cx + d, cy + d, "M1 (+X)", "#38bdf8"),
+            (cx + d, cy - d, "M2 (+Y)", "#a855f7"),
+            (cx - d, cy - d, "M3 (-X)", "#f97316"),
+            (cx - d, cy + d, "M4 (-Y)", "#10b981"),
         ]
 
-        net_fx = 0.0
-        net_fy = 0.0
+        net_dx = 0.0
+        net_dy = 0.0
 
         for i, (ax, ay, label, color) in enumerate(anchors):
             deg = self.motor_vars[i].get()
-            tension_norm = deg / MAX_ANGLE_DEG  # 0.0 to 1.0
+            cur_limit = self.max_limit_var.get() if hasattr(self, "max_limit_var") and self.max_limit_var.get() > 0 else MAX_ANGLE_DEG
+            tension_norm = min(1.0, deg / cur_limit)  # 0.0 to 1.0
 
             # Draw anchor circle
             self.canvas.create_oval(ax - 7, ay - 7, ax + 7, ay + 7, fill=color, outline="")
@@ -598,15 +615,13 @@ class CableRobotGUI:
                 t_y = cy + (ay - cy) * tension_norm
                 self.canvas.create_line(cx, cy, t_x, t_y, fill=color, width=int(1 + tension_norm * 4))
 
-            # Accumulate net bending vector
-            if i == 0: net_fx += tension_norm
-            elif i == 1: net_fy -= tension_norm
-            elif i == 2: net_fx -= tension_norm
-            elif i == 3: net_fy += tension_norm
+            # Accumulate net bending vector along each motor's line of action
+            net_dx += ((ax - cx) / r_outer) * tension_norm
+            net_dy += ((ay - cy) / r_outer) * tension_norm
 
         # Tip bending indicator dot
-        tip_x = cx + net_fx * (r_outer * 0.7)
-        tip_y = cy + net_fy * (r_outer * 0.7)
+        tip_x = cx + net_dx * (r_outer * 0.7)
+        tip_y = cy + net_dy * (r_outer * 0.7)
 
         # Draw soft center backbone
         self.canvas.create_line(cx, cy, tip_x, tip_y, fill="#f72585", width=3)
@@ -695,6 +710,406 @@ class CableRobotGUI:
             font=(FONT_MAIN, 9, "bold"),
         )
         btn_down.grid(row=2, column=1, padx=4, pady=4)
+
+    def create_trajectory_recorder_panel(self, parent):
+        group = tk.LabelFrame(
+            parent,
+            text=" 🎬 Manual Trajectory Recorder & Replay ",
+            font=(FONT_MAIN, 11, "bold"),
+            fg=self.accent_color,
+            bg=self.panel_bg,
+            padx=15,
+            pady=8,
+        )
+        group.pack(fill=tk.X, pady=(0, 8))
+
+        # Row 1: Action Controls, Speed, and Loop
+        row1 = tk.Frame(group, bg=self.panel_bg)
+        row1.pack(fill=tk.X, pady=(0, 6))
+
+        btn_rec = tk.Button(
+            row1,
+            text="🔴 Record",
+            command=self.start_recording,
+            bg="#dc2626",
+            fg="white",
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+            font=(FONT_MAIN, 9, "bold"),
+            cursor="hand2",
+        )
+        btn_rec.pack(side=tk.LEFT, padx=3)
+        self.rec_btn_widgets["record"] = btn_rec
+
+        btn_stop = tk.Button(
+            row1,
+            text="⏹️ Stop",
+            command=self.stop_recording,
+            bg="#4b5563",
+            fg="white",
+            relief=tk.FLAT,
+            padx=8,
+            pady=4,
+            font=(FONT_MAIN, 9, "bold"),
+            state=tk.DISABLED,
+            cursor="hand2",
+        )
+        btn_stop.pack(side=tk.LEFT, padx=3)
+        self.rec_btn_widgets["stop"] = btn_stop
+
+        btn_replay = tk.Button(
+            row1,
+            text="▶️ Replay",
+            command=self.start_replay,
+            bg="#16a34a",
+            fg="white",
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+            font=(FONT_MAIN, 9, "bold"),
+            state=tk.DISABLED,
+            cursor="hand2",
+        )
+        btn_replay.pack(side=tk.LEFT, padx=3)
+        self.rec_btn_widgets["replay"] = btn_replay
+
+        btn_abort = tk.Button(
+            row1,
+            text="🛑 Abort",
+            command=self.abort_replay,
+            bg="#6b7280",
+            fg="white",
+            relief=tk.FLAT,
+            padx=8,
+            pady=4,
+            font=(FONT_MAIN, 9),
+            state=tk.DISABLED,
+            cursor="hand2",
+        )
+        btn_abort.pack(side=tk.LEFT, padx=3)
+        self.rec_btn_widgets["abort"] = btn_abort
+
+        # Speed selector
+        lbl_sp = tk.Label(row1, text="Speed:", fg=self.text_color, bg=self.panel_bg, font=(FONT_MAIN, 9))
+        lbl_sp.pack(side=tk.LEFT, padx=(10, 2))
+
+        speed_menu = tk.OptionMenu(row1, self.replay_speed_var, "0.5x", "1.0x", "1.5x", "2.0x")
+        speed_menu.config(bg="#2b2d42", fg="white", activebackground="#3a0ca3", activeforeground="white", highlightthickness=0, font=(FONT_MAIN, 8), width=4)
+        speed_menu["menu"].config(bg="#2b2d42", fg="white")
+        speed_menu.pack(side=tk.LEFT, padx=2)
+
+        chk_loop = tk.Checkbutton(
+            row1,
+            text="🔁 Loop",
+            variable=self.replay_loop_var,
+            fg=self.text_color,
+            bg=self.panel_bg,
+            selectcolor="#111217",
+            activebackground=self.panel_bg,
+            font=(FONT_MAIN, 9),
+        )
+        chk_loop.pack(side=tk.LEFT, padx=6)
+
+        # Row 2: Status Readout & File I/O
+        row2 = tk.Frame(group, bg=self.panel_bg)
+        row2.pack(fill=tk.X, pady=(2, 0))
+
+        lbl_status = tk.Label(
+            row2,
+            textvariable=self.trajectory_status_var,
+            font=(FONT_MONO, 9, "bold"),
+            fg="#38bdf8",
+            bg=self.panel_bg,
+            anchor="w",
+        )
+        lbl_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        btn_save = tk.Button(
+            row2,
+            text="💾 Save",
+            command=self.save_trajectory,
+            bg="#4338ca",
+            fg="white",
+            relief=tk.FLAT,
+            padx=8,
+            pady=2,
+            font=(FONT_MAIN, 8, "bold"),
+            state=tk.DISABLED,
+            cursor="hand2",
+        )
+        btn_save.pack(side=tk.LEFT, padx=2)
+        self.rec_btn_widgets["save"] = btn_save
+
+        btn_load = tk.Button(
+            row2,
+            text="📂 Load",
+            command=self.load_trajectory,
+            bg="#0284c7",
+            fg="white",
+            relief=tk.FLAT,
+            padx=8,
+            pady=2,
+            font=(FONT_MAIN, 8, "bold"),
+            cursor="hand2",
+        )
+        btn_load.pack(side=tk.LEFT, padx=2)
+        self.rec_btn_widgets["load"] = btn_load
+
+        btn_clear = tk.Button(
+            row2,
+            text="🗑️ Clear",
+            command=self.clear_trajectory,
+            bg="#212529",
+            fg="#94a3b8",
+            relief=tk.FLAT,
+            padx=6,
+            pady=2,
+            font=(FONT_MAIN, 8),
+            state=tk.DISABLED,
+            cursor="hand2",
+        )
+        btn_clear.pack(side=tk.LEFT, padx=2)
+        self.rec_btn_widgets["clear"] = btn_clear
+
+    def update_recorder_ui_state(self):
+        """Updates enable/disable states and colors of recorder buttons."""
+        if not hasattr(self, "rec_btn_widgets") or not self.rec_btn_widgets:
+            return
+
+        has_data = bool(self.recorded_trajectory)
+        if self.is_recording:
+            self.rec_btn_widgets["record"].config(state=tk.DISABLED, bg="#7f1d1d")
+            self.rec_btn_widgets["stop"].config(state=tk.NORMAL, bg="#e11d48")
+            self.rec_btn_widgets["replay"].config(state=tk.DISABLED)
+            self.rec_btn_widgets["abort"].config(state=tk.DISABLED)
+            self.rec_btn_widgets["save"].config(state=tk.DISABLED)
+            self.rec_btn_widgets["load"].config(state=tk.DISABLED)
+            self.rec_btn_widgets["clear"].config(state=tk.DISABLED)
+        elif self.is_replaying:
+            self.rec_btn_widgets["record"].config(state=tk.DISABLED)
+            self.rec_btn_widgets["stop"].config(state=tk.DISABLED)
+            self.rec_btn_widgets["replay"].config(state=tk.DISABLED)
+            self.rec_btn_widgets["abort"].config(state=tk.NORMAL, bg="#dc2626")
+            self.rec_btn_widgets["save"].config(state=tk.DISABLED)
+            self.rec_btn_widgets["load"].config(state=tk.DISABLED)
+            self.rec_btn_widgets["clear"].config(state=tk.DISABLED)
+        else:
+            self.rec_btn_widgets["record"].config(state=tk.NORMAL, bg="#dc2626")
+            self.rec_btn_widgets["stop"].config(state=tk.DISABLED, bg="#4b5563")
+            self.rec_btn_widgets["replay"].config(state=tk.NORMAL if has_data else tk.DISABLED, bg="#16a34a" if has_data else "#4b5563")
+            self.rec_btn_widgets["abort"].config(state=tk.DISABLED, bg="#6b7280")
+            self.rec_btn_widgets["save"].config(state=tk.NORMAL if has_data else tk.DISABLED)
+            self.rec_btn_widgets["load"].config(state=tk.NORMAL)
+            self.rec_btn_widgets["clear"].config(state=tk.NORMAL if has_data else tk.DISABLED)
+
+    def start_recording(self):
+        if self.is_replaying:
+            return
+        self.is_recording = True
+        self.recorded_trajectory = []
+        self.record_start_time = time.perf_counter()
+        initial_angles = [round(float(v.get()), 2) for v in self.motor_vars]
+        self.recorded_trajectory.append({"t": 0.0, "angles": list(initial_angles)})
+        self.update_recorder_ui_state()
+        self._record_tick()
+
+    def _record_tick(self):
+        if not self.is_recording:
+            return
+        elapsed = time.perf_counter() - self.record_start_time
+        current_angles = [round(float(v.get()), 2) for v in self.motor_vars]
+        if (not self.recorded_trajectory or
+            self.recorded_trajectory[-1]["angles"] != current_angles or
+            (elapsed - self.recorded_trajectory[-1]["t"]) >= 0.20):
+            self.recorded_trajectory.append({
+                "t": round(elapsed, 3),
+                "angles": list(current_angles)
+            })
+        n_pts = len(self.recorded_trajectory)
+        self.trajectory_status_var.set(f"🔴 Recording: {elapsed:5.1f}s ({n_pts} pts)")
+        self.record_timer_id = self.root.after(50, self._record_tick)
+
+    def stop_recording(self):
+        if not self.is_recording:
+            return
+        self.is_recording = False
+        if self.record_timer_id:
+            try:
+                self.root.after_cancel(self.record_timer_id)
+            except Exception:
+                pass
+            self.record_timer_id = None
+
+        if self.recorded_trajectory:
+            elapsed = time.perf_counter() - self.record_start_time
+            current_angles = [round(float(v.get()), 2) for v in self.motor_vars]
+            self.recorded_trajectory.append({
+                "t": round(elapsed, 3),
+                "angles": list(current_angles)
+            })
+            total_time = self.recorded_trajectory[-1]["t"]
+            n_pts = len(self.recorded_trajectory)
+            self.trajectory_status_var.set(f"✅ Ready: {n_pts} pts ({total_time:.1f}s)")
+        else:
+            self.trajectory_status_var.set("Ready • No trajectory recorded")
+
+        self.update_recorder_ui_state()
+
+    def start_replay(self):
+        if not self.recorded_trajectory or self.is_recording or self.is_replaying:
+            return
+        self.is_replaying = True
+        self.replay_stop_event.clear()
+        self.update_recorder_ui_state()
+
+        speed_str = self.replay_speed_var.get().replace("x", "")
+        try:
+            speed = float(speed_str)
+            if speed <= 0: speed = 1.0
+        except ValueError:
+            speed = 1.0
+
+        loop = self.replay_loop_var.get()
+        thread = threading.Thread(
+            target=self._replay_worker,
+            args=(list(self.recorded_trajectory), speed, loop),
+            daemon=True
+        )
+        thread.start()
+
+    def _replay_worker(self, trajectory, speed, loop):
+        try:
+            self.is_moving_thread = True
+            while not self.replay_stop_event.is_set():
+                # Smoothly lead in to trajectory starting position if away
+                start_angles = trajectory[0]["angles"]
+                cur_angles = [float(v.get()) for v in self.motor_vars]
+                dist = max(abs(cur_angles[i] - start_angles[i]) for i in range(4))
+                if dist > 1.0:
+                    self.root.after(0, lambda: self.trajectory_status_var.set("Moving to trajectory start..."))
+                    steps = 25
+                    dt = 0.8 / steps
+                    for s in range(1, steps + 1):
+                        if self.replay_stop_event.is_set():
+                            return
+                        alpha = (1.0 - math.cos(math.pi * (s / float(steps)))) / 2.0
+                        interp = [cur_angles[i] + alpha * (start_angles[i] - cur_angles[i]) for i in range(4)]
+                        self._apply_angles_gui(interp)
+                        time.sleep(dt)
+
+                # Replay each waypoint synchronized to recorded timestamps
+                total_duration = trajectory[-1]["t"]
+                replay_start = time.perf_counter()
+                for i, pt in enumerate(trajectory):
+                    if self.replay_stop_event.is_set():
+                        return
+                    target_t = pt["t"] / speed
+                    elapsed = time.perf_counter() - replay_start
+                    wait_time = target_t - elapsed
+                    if wait_time > 0:
+                        time.sleep(wait_time)
+
+                    self._apply_angles_gui(pt["angles"])
+                    pct = int((i + 1) / len(trajectory) * 100)
+                    cur_t = pt["t"]
+                    self.root.after(0, lambda t=cur_t, p=pct: self.trajectory_status_var.set(
+                        f"▶️ Replaying ({speed:g}x): {t:.1f}s / {total_duration:.1f}s ({p}%)"
+                    ))
+
+                if not loop:
+                    break
+                time.sleep(0.3)
+        finally:
+            self.is_moving_thread = False
+            self.is_replaying = False
+            self.root.after(0, self.update_recorder_ui_state)
+            if not self.replay_stop_event.is_set():
+                self.root.after(0, lambda: self.trajectory_status_var.set(f"✅ Replay Complete ({len(trajectory)} pts)"))
+            else:
+                self.root.after(0, lambda: self.trajectory_status_var.set("⏹️ Replay Aborted"))
+
+    def _apply_angles_gui(self, angles):
+        """Sends motor angles to robot controller and updates GUI sliders and visualizer."""
+        rads = [math.radians(a) for a in angles]
+        self.robot.send_angles(rads)
+        self.root.after(0, self._sync_slider_vars, list(angles))
+
+    def _sync_slider_vars(self, angles):
+        for i in range(4):
+            self.motor_vars[i].set(angles[i])
+            self.val_labels[i].config(text=f"{angles[i]:5.1f}° ({math.radians(angles[i]):.2f} rad)")
+        self.draw_canvas_visualizer()
+
+    def abort_replay(self):
+        if self.is_replaying:
+            self.replay_stop_event.set()
+
+    def save_trajectory(self):
+        if not self.recorded_trajectory:
+            messagebox.showinfo("No Data", "No recorded trajectory to save.")
+            return
+        from tkinter import filedialog
+        import json
+        os.makedirs("trajectories", exist_ok=True)
+        default_name = f"trajectory_{int(time.time())}.json"
+        filepath = filedialog.asksaveasfilename(
+            initialdir="trajectories",
+            initialfile=default_name,
+            defaultextension=".json",
+            filetypes=[("JSON Trajectory", "*.json"), ("All Files", "*.*")]
+        )
+        if not filepath:
+            return
+        data = {
+            "name": os.path.basename(filepath),
+            "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_s": self.recorded_trajectory[-1]["t"] if self.recorded_trajectory else 0.0,
+            "num_points": len(self.recorded_trajectory),
+            "trajectory": self.recorded_trajectory,
+        }
+        try:
+            with open(filepath, "w") as f:
+                json.dump(data, f, indent=2)
+            self.log_seq_message(f"Saved trajectory to: {os.path.basename(filepath)}")
+            messagebox.showinfo("Saved", f"Trajectory saved to {os.path.basename(filepath)}\n({len(self.recorded_trajectory)} waypoints, {data['duration_s']:.1f}s)")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save trajectory: {e}")
+
+    def load_trajectory(self):
+        from tkinter import filedialog
+        import json
+        os.makedirs("trajectories", exist_ok=True)
+        filepath = filedialog.askopenfilename(
+            initialdir="trajectories",
+            filetypes=[("JSON Trajectory", "*.json"), ("All Files", "*.*")]
+        )
+        if not filepath:
+            return
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "trajectory" in data:
+                self.recorded_trajectory = data["trajectory"]
+            elif isinstance(data, list):
+                self.recorded_trajectory = data
+            else:
+                raise ValueError("Invalid format: expected 'trajectory' list")
+
+            total_t = self.recorded_trajectory[-1]["t"] if self.recorded_trajectory else 0.0
+            n_pts = len(self.recorded_trajectory)
+            self.trajectory_status_var.set(f"📂 Loaded: {os.path.basename(filepath)} ({n_pts} pts, {total_t:.1f}s)")
+            self.log_seq_message(f"Loaded trajectory: {os.path.basename(filepath)} ({n_pts} pts)")
+            self.update_recorder_ui_state()
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not load trajectory: {e}")
+
+    def clear_trajectory(self):
+        if self.is_recording or self.is_replaying:
+            return
+        self.recorded_trajectory = []
+        self.trajectory_status_var.set("Ready • No trajectory recorded")
+        self.update_recorder_ui_state()
 
     def create_motion_routines_panel(self, parent):
         group = tk.LabelFrame(
@@ -818,13 +1233,15 @@ class CableRobotGUI:
             limit_frame,
             from_=15.0,
             to=MAX_ANGLE_DEG,
-            increment=5.0,
+            increment=15.0,
             textvariable=self.max_limit_var,
             width=5,
             command=self.update_max_limit,
             font=(FONT_MAIN, 9),
         )
         limit_spin.pack(side=tk.LEFT, padx=3)
+        limit_spin.bind("<Return>", lambda e: self.update_max_limit())
+        limit_spin.bind("<FocusOut>", lambda e: self.update_max_limit())
 
     def open_cartesian_controller(self):
         """Launches the dedicated Cartesian XYZ task-space controller."""
@@ -1986,9 +2403,11 @@ class CableRobotGUI:
         self.execute_full_obstacle_sequence()
 
     def stop_all_autonomous_actions(self):
-        """Emergency stop for all autonomous vision and servoing actions."""
+        """Emergency stop for all autonomous vision, servoing, and replay actions."""
         self.stop_servoing()
         self.retriever.stop()
+        self.stop_recording()
+        self.abort_replay()
 
     def log_seq_message(self, msg):
         """Appends timestamped message to the activity log."""
@@ -2053,10 +2472,16 @@ class CableRobotGUI:
             messagebox.showerror("Error", f"Could not launch camera viewer: {e}")
 
     def update_max_limit(self):
-        max_deg = self.max_limit_var.get()
+        try:
+            max_deg = float(self.max_limit_var.get())
+        except (ValueError, tk.TclError):
+            max_deg = MAX_ANGLE_DEG
+        max_deg = max(15.0, min(MAX_ANGLE_DEG, max_deg))
+        self.max_limit_var.set(max_deg)
         self.robot.max_angle = math.radians(max_deg)
         for slider in self.slider_widgets:
             slider.config(to=max_deg)
+        self.draw_canvas_visualizer()
 
     def on_slider_change(self, index, val_str):
         if self.is_moving_thread:
@@ -2069,6 +2494,13 @@ class CableRobotGUI:
         # Send target angles directly
         all_rads = [math.radians(v.get()) for v in self.motor_vars]
         self.robot.send_angles(all_rads)
+
+        # Record manual slider adjustments in real time
+        if self.is_recording:
+            elapsed = time.perf_counter() - self.record_start_time
+            cur_deg = [round(float(v.get()), 2) for v in self.motor_vars]
+            if not self.recorded_trajectory or self.recorded_trajectory[-1]["angles"] != cur_deg:
+                self.recorded_trajectory.append({"t": round(elapsed, 3), "angles": list(cur_deg)})
 
     def nudge_motor(self, index, delta_deg):
         current = self.motor_vars[index].get()
