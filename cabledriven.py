@@ -161,16 +161,24 @@ class CableDrivenRobotController:
                 except Exception as e:
                     print(f"[WARN] Could not enable Extended Position Mode: {e}")
 
-                # Start interpolating from where the motors really are, with signed 32-bit pulse decoding.
-                try:
-                    pulses = emio.motors._mg.getCurrentPosition()
-                    if pulses:
-                        signed_pulses = [(p - 0x100000000 if p >= 0x80000000 else p) for p in pulses]
-                        self.current_angles = [float(emio.motors.pulseToRad([p])[0]) for p in signed_pulses]
-                    else:
-                        self.current_angles = [float(a) for a in emio.motors.angles]
-                except Exception:
-                    self.current_angles = [float(a) for a in emio.motors.angles]
+                # Allow bus to settle after torque enable, then read initial positions with retry.
+                read_ok = False
+                for attempt in range(3):
+                    try:
+                        time.sleep(0.05)
+                        pulses = emio.motors._mg.getCurrentPosition()
+                        if pulses:
+                            signed_pulses = [(p - 0x100000000 if p >= 0x80000000 else p) for p in pulses]
+                            self.current_angles = [float(emio.motors.pulseToRad([p])[0]) for p in signed_pulses]
+                            read_ok = True
+                            break
+                    except Exception as ex:
+                        if attempt < 2:
+                            time.sleep(0.05)
+                        else:
+                            print(f"[WARN] Could not read initial motor pulses ({ex}), defaulting to neutral 0.0 rad.")
+                if not read_ok:
+                    self.current_angles = [0.0] * self.num_motors
 
                 self.is_connected = True
                 self.is_mock = False
