@@ -21,8 +21,12 @@ It toggles the same way (the opposite button disengages, the opposite motor is r
 Pressing a button on one pad disengages every active button on the other pad.
 """
 
+import json
 import math
+import os
+import time
 import tkinter as tk
+from tkinter import filedialog, messagebox
 
 from cabledriven import CableDrivenRobotController, MAX_ANGLE_DEG
 
@@ -66,6 +70,8 @@ class ToggleDPad:
         self.amplitude = 90.0
         self.active = set()
         self.buttons = {}
+        self.trajectory = []
+        self.replay_state = None  # None, or dict(phase, t0)
 
         self.status = tk.Label(root, text="")
         self.status.pack(pady=(10, 0))
@@ -93,6 +99,21 @@ class ToggleDPad:
             b = tk.Button(grids[pad], text=name, width=11, height=3, command=lambda n=name: self.press(n))
             b.grid(row=r, column=c)
             self.buttons[name] = b
+
+        rep = tk.Frame(root)
+        rep.pack()
+        tk.Button(rep, text="Load", command=self.load_trajectory).pack(side=tk.LEFT, padx=2)
+        self.replay_btn = tk.Button(rep, text="Replay", command=self.start_replay, state=tk.DISABLED)
+        self.replay_btn.pack(side=tk.LEFT, padx=2)
+        self.abort_btn = tk.Button(rep, text="Abort", command=self.abort_replay, state=tk.DISABLED)
+        self.abort_btn.pack(side=tk.LEFT, padx=2)
+        tk.Label(rep, text="Speed:").pack(side=tk.LEFT, padx=(8, 2))
+        self.speed_var = tk.StringVar(value="1.0x")
+        tk.OptionMenu(rep, self.speed_var, "0.5x", "1.0x", "1.5x", "2.0x").pack(side=tk.LEFT)
+        self.loop_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(rep, text="Loop", variable=self.loop_var).pack(side=tk.LEFT)
+        self.traj_label = tk.Label(root, text="No trajectory loaded")
+        self.traj_label.pack()
 
         self.readout = tk.Label(root, text="")
         self.readout.pack(pady=(0, 10))
@@ -134,7 +155,79 @@ class ToggleDPad:
         c.create_oval(tip_x - 6, tip_y - 6, tip_x + 6, tip_y + 6, fill="#f72585", outline="white")
         c.create_oval(cx - R_INNER, cy - R_INNER, cx + R_INNER, cy + R_INNER, outline="#555", width=1.5)
 
+    def load_trajectory(self):
+        if self.replay_state:
+            return
+        os.makedirs("trajectories", exist_ok=True)
+        path = filedialog.askopenfilename(
+            initialdir="trajectories",
+            filetypes=[("JSON Trajectory", "*.json"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            traj = data["trajectory"] if isinstance(data, dict) else data
+            if not traj:
+                raise ValueError("empty trajectory")
+            self.trajectory = [(float(p["t"]), [float(a) for a in p["angles"][:4]]) for p in traj]
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not load trajectory: {e}")
+            return
+        self.traj_label.config(
+            text=f"Loaded: {os.path.basename(path)} ({len(self.trajectory)} pts, {self.trajectory[-1][0]:.1f}s)"
+        )
+        self.replay_btn.config(state=tk.NORMAL)
+
+    def start_replay(self):
+        if not self.trajectory or self.replay_state:
+            return
+        self.active.clear()
+        self.refresh()
+        self.replay_state = {"phase": "lead", "t0": 0.0}
+        self.replay_btn.config(state=tk.DISABLED)
+        self.abort_btn.config(state=tk.NORMAL)
+
+    def abort_replay(self):
+        self.end_replay("Replay aborted")
+
+    def end_replay(self, msg):
+        if not self.replay_state:
+            return
+        self.replay_state = None
+        self.replay_btn.config(state=tk.NORMAL)
+        self.abort_btn.config(state=tk.DISABLED)
+        self.traj_label.config(text=msg)
+
+    def replay_angles(self):
+        """Replay-mode angles for this tick (None = fall back to the normal ramp)."""
+        st = self.replay_state
+        traj = self.trajectory
+        if st["phase"] == "lead":
+            if max(abs(a - b) for a, b in zip(self.angles, traj[0][1])) > 1.0:
+                return None, traj[0][1]
+            st["phase"], st["t0"] = "play", time.perf_counter()
+        speed = float(self.speed_var.get().rstrip("x"))
+        t = (time.perf_counter() - st["t0"]) * speed
+        total = traj[-1][0]
+        if t >= total:
+            if self.loop_var.get():
+                st["phase"] = "lead"
+                return None, traj[0][1]
+            self.end_replay(f"Replay complete ({len(traj)} pts)")
+            return traj[-1][1], None
+        # linear interpolation between the two surrounding waypoints
+        for (t0, a0), (t1, a1) in zip(traj, traj[1:]):
+            if t0 <= t <= t1:
+                f = (t - t0) / (t1 - t0) if t1 > t0 else 1.0
+                self.traj_label.config(text=f"Replaying ({speed:g}x): {t:.1f}s / {total:.1f}s")
+                return [x + f * (y - x) for x, y in zip(a0, a1)], None
+        return traj[-1][1], None
+
     def press(self, name):
+        if self.replay_state:
+            return
         if name in self.active:
             self.active.discard(name)
         else:
@@ -171,9 +264,17 @@ class ToggleDPad:
     def tick(self):
         max_step = SPEED_DEG_PER_S * TICK_MS / 1000.0
         targets = self.targets_deg()
-        for i in range(4):
-            diff = targets[i] - self.angles[i]
-            self.angles[i] += max(-max_step, min(max_step, diff))
+        if self.replay_state:
+            direct, lead_target = self.replay_angles()
+            if direct is not None:
+                self.angles = list(direct)
+                targets = None
+            elif lead_target is not None:
+                targets = lead_target
+        if targets is not None:
+            for i in range(4):
+                diff = targets[i] - self.angles[i]
+                self.angles[i] += max(-max_step, min(max_step, diff))
         self.robot.send_angles([math.radians(a) for a in self.angles])
         self.readout.config(text="  ".join(f"M{i + 1}: {a:6.1f}°" for i, a in enumerate(self.angles)))
         self.draw()
