@@ -32,6 +32,7 @@ from cabledriven import CableDrivenRobotController, MAX_ANGLE_DEG
 
 SPEED_DEG_PER_S = 90.0
 TICK_MS = 50
+INCREMENT_DEG = 10.0
 CANVAS_SIZE = 200
 R_OUTER = 80
 R_INNER = 15
@@ -69,6 +70,7 @@ class ToggleDPad:
         self.angles = [0.0] * 4
         self.amplitude = 90.0
         self.active = set()
+        self.inc_targets = [0.0] * 4
         self.buttons = {}
         self.trajectory = []
         self.replay_state = None  # None, or dict(phase, t0)
@@ -88,6 +90,10 @@ class ToggleDPad:
         entry.pack(side=tk.LEFT, padx=4)
         entry.bind("<Return>", lambda e: self.apply_amplitude())
         tk.Button(amp, text="Apply", command=self.apply_amplitude).pack(side=tk.LEFT)
+        self.incremental_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            amp, text=f"Incremental ({INCREMENT_DEG:g}°)", variable=self.incremental_var, command=self.clear
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         pads = tk.Frame(root)
         pads.pack(padx=10, pady=10)
@@ -112,6 +118,9 @@ class ToggleDPad:
         tk.OptionMenu(rep, self.speed_var, "0.5x", "1.0x", "1.5x", "2.0x").pack(side=tk.LEFT)
         self.loop_var = tk.BooleanVar(value=False)
         tk.Checkbutton(rep, text="Loop", variable=self.loop_var).pack(side=tk.LEFT)
+        self.backtrack_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(rep, text="Backtrack", variable=self.backtrack_var).pack(side=tk.LEFT)
+        self.play_traj = []
         self.traj_label = tk.Label(root, text="No trajectory loaded")
         self.traj_label.pack()
 
@@ -185,6 +194,10 @@ class ToggleDPad:
             return
         self.active.clear()
         self.refresh()
+        self.play_traj = list(self.trajectory)
+        if self.backtrack_var.get():
+            total = self.play_traj[-1][0]
+            self.play_traj += [(2 * total - t, list(a)) for t, a in reversed(self.trajectory[:-1])]
         self.replay_state = {"phase": "lead", "t0": 0.0}
         self.replay_btn.config(state=tk.DISABLED)
         self.abort_btn.config(state=tk.NORMAL)
@@ -203,7 +216,7 @@ class ToggleDPad:
     def replay_angles(self):
         """Replay-mode angles for this tick (None = fall back to the normal ramp)."""
         st = self.replay_state
-        traj = self.trajectory
+        traj = self.play_traj
         if st["phase"] == "lead":
             if max(abs(a - b) for a, b in zip(self.angles, traj[0][1])) > 1.0:
                 return None, traj[0][1]
@@ -228,6 +241,12 @@ class ToggleDPad:
     def press(self, name):
         if self.replay_state:
             return
+        if self.incremental_var.get():
+            for m in BUTTONS[name][2]:
+                self.inc_targets[m] += INCREMENT_DEG
+                self.inc_targets[(m + 2) % 4] -= INCREMENT_DEG
+            self.inc_targets = [max(0.0, min(self.amplitude, v)) for v in self.inc_targets]
+            return
         if name in self.active:
             self.active.discard(name)
         else:
@@ -246,6 +265,7 @@ class ToggleDPad:
 
     def clear(self):
         self.active.clear()
+        self.inc_targets = [0.0] * 4
         self.refresh()
 
     def refresh(self):
@@ -253,6 +273,8 @@ class ToggleDPad:
             b.config(relief=tk.SUNKEN if name in self.active else tk.RAISED)
 
     def targets_deg(self):
+        if self.incremental_var.get():
+            return [min(v, self.amplitude) for v in self.inc_targets]
         t = [0.0] * 4
         for name in self.active:
             motors = BUTTONS[name][2]
