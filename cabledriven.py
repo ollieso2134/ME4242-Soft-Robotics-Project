@@ -35,6 +35,14 @@ except Exception:
 # Software limit for motor angles. Defaulting to 360.0 deg (multi-turn rotation).
 MAX_ANGLE_DEG = 360.0
 
+# Zero-based motor indices whose rotation direction is flipped at the hardware boundary.
+REVERSED_MOTORS = (1, 3)
+
+
+def _apply_direction(angles):
+    """Negate angles of reversed motors (self-inverse: used for both send and read)."""
+    return [-a if i in REVERSED_MOTORS else a for i, a in enumerate(angles)]
+
 
 class CableDrivenRobotController:
     def __init__(self, min_angle=0.0, max_angle=math.radians(MAX_ANGLE_DEG), num_motors=4):
@@ -169,7 +177,9 @@ class CableDrivenRobotController:
                         pulses = emio.motors._mg.getCurrentPosition()
                         if pulses:
                             signed_pulses = [(p - 0x100000000 if p >= 0x80000000 else p) for p in pulses]
-                            self.current_angles = [float(emio.motors.pulseToRad([p])[0]) for p in signed_pulses]
+                            self.current_angles = _apply_direction(
+                                [float(emio.motors.pulseToRad([p])[0]) for p in signed_pulses]
+                            )
                             read_ok = True
                             break
                     except Exception as ex:
@@ -223,7 +233,7 @@ class CableDrivenRobotController:
 
         if not self.is_mock and self.emio is not None:
             try:
-                self.emio.motors.angles = safe_angles
+                self.emio.motors.angles = _apply_direction(safe_angles)
             except Exception as e:
                 print(f"[ERROR] Failed to send angles to EMIO: {e}")
         else:
