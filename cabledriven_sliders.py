@@ -111,6 +111,17 @@ class SliderRecorder:
 
         self.info = tk.Label(root, text="", font=("Consolas", 9), justify="left")
         self.info.pack(padx=10, pady=(0, 8), anchor="w")
+        # Numpad: 7 4 1 0 drive M1-M4 negative, 9 6 3 Enter drive M1-M4 positive, for as long as held.
+        # Any number of keys can be held at once.
+        self.held = {}          # (motor, direction) -> pending release callback id or None
+        neg_keys = [("KP_7", "KP_Home"), ("KP_4", "KP_Left"), ("KP_1", "KP_End"), ("KP_0", "KP_Insert")]
+        pos_keys = [("KP_9", "KP_Prior"), ("KP_6", "KP_Right"), ("KP_3", "KP_Next"), ("KP_Enter",)]
+        for i in range(4):
+            for keys, d in ((neg_keys[i], -1), (pos_keys[i], +1)):
+                for key in keys:
+                    root.bind(f"<KeyPress-{key}>", lambda e, i=i, d=d: self._key_down(i, d))
+                    root.bind(f"<KeyRelease-{key}>", lambda e, i=i, d=d: self._key_up(i, d))
+
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.tick()
 
@@ -129,6 +140,25 @@ class SliderRecorder:
             return
         self.targets[i] = min(max(self.targets[i] + step, REL_MIN_DEG), MAX_ANGLE_DEG)
         self._set_scale(i, self.targets[i])
+        self.holding = False
+
+    def _key_down(self, i, d):
+        pending = self.held.get((i, d))
+        if pending:  # auto-repeat sends release+press pairs: cancel the pending release
+            self.root.after_cancel(pending)
+        self.held[(i, d)] = None
+
+    def _key_up(self, i, d):
+        if (i, d) in self.held:
+            self.held[(i, d)] = self.root.after(30, lambda: self.held.pop((i, d), None))
+
+    def _apply_held_keys(self):
+        if not self.held or self.replay or self.released:
+            return
+        step = SPEED_DEG_PER_S * TICK_MS / 1000.0
+        for (i, d) in self.held:
+            self.targets[i] = min(max(self.targets[i] + d * step, REL_MIN_DEG), MAX_ANGLE_DEG)
+            self._set_scale(i, self.targets[i])
         self.holding = False
 
     def _set_scale(self, i, value):
@@ -310,6 +340,7 @@ class SliderRecorder:
 
     # -- loop -------------------------------------------------------------------
     def tick(self):
+        self._apply_held_keys()
         if not self.holding:
             step = SPEED_DEG_PER_S * TICK_MS / 1000.0
             if self.replay:
