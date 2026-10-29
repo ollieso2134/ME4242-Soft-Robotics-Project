@@ -91,6 +91,10 @@ class ToggleDPad:
         default_port = port or (self.available_ports[0] if self.available_ports else None)
 
         self.angles = [0.0] * 4
+        # After connecting, hold the motors where they are (send nothing) until the user
+        # presses a D-pad button, Relax or Replay. Otherwise the tick loop would drive
+        # every motor to 0 deg as soon as the program starts.
+        self.holding = False
         self.amplitude = 90.0
         self.active = set()
         self.inc_targets = [0.0] * 4
@@ -167,7 +171,7 @@ class ToggleDPad:
             g = tk.Frame(pf)
             g.pack()
             grids.append(g)
-            tk.Button(g, text="Relax", width=11, height=3, command=self.clear).grid(row=1, column=1)
+            tk.Button(g, text="Relax", width=11, height=3, command=self.relax).grid(row=1, column=1)
 
         motor_colors = {
             "M1 (+X)": "#0284c7",
@@ -266,6 +270,11 @@ class ToggleDPad:
         self.robot.connect(port=port)
         if self.robot.is_connected and not self.robot.is_mock:
             self.angles = [math.degrees(a) for a in self.robot.current_angles]
+            self.holding = True
+            outside = [f"M{i + 1} {a:.1f} deg" for i, a in enumerate(self.angles) if a < 0.0 or a > MAX_ANGLE_DEG]
+            if outside:
+                print(f"[WARN] Outside 0-{MAX_ANGLE_DEG:g} deg: {', '.join(outside)}. "
+                      "These motors will jump into range when you first move them; check the cables first.")
             actual_port = getattr(self.robot, "port", None) or port
             if actual_port:
                 if actual_port not in self.available_ports:
@@ -412,6 +421,7 @@ class ToggleDPad:
     def start_replay(self):
         if not self.trajectory or self.replay_state or self.recording:
             return
+        self.holding = False
         self.active.clear()
         self.refresh()
         self.play_traj = list(self.trajectory)
@@ -467,6 +477,7 @@ class ToggleDPad:
     def press(self, name):
         if self.replay_state:
             return
+        self.holding = False
         co_tension = self.co_tension_var.get()
         if self.incremental_var.get():
             for m in BUTTONS[name][2]:
@@ -494,6 +505,11 @@ class ToggleDPad:
         self.amplitude = max(0.0, min(MAX_ANGLE_DEG, value))
         self.amp_var.set(f"{self.amplitude:g}")
 
+    def relax(self):
+        """Relax button: release the hold-on-connect and relax all motors."""
+        self.holding = False
+        self.clear()
+
     def clear(self):
         self.active.clear()
         self.inc_targets = [0.0] * 4
@@ -519,6 +535,11 @@ class ToggleDPad:
         return [max(0.0, min(limit, v)) for v in t]
 
     def tick(self):
+        if self.holding:
+            self.readout.config(text="Holding the motors where they are. Press a D-pad button, Relax or Replay to move.")
+            self.draw()
+            self.root.after(TICK_MS, self.tick)
+            return
         max_step = SPEED_DEG_PER_S * TICK_MS / 1000.0
         targets = self.targets_deg()
         if self.replay_state:

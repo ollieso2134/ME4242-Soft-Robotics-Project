@@ -44,6 +44,48 @@ def _apply_direction(angles):
     return [-a if i in REVERSED_MOTORS else a for i, a in enumerate(angles)]
 
 
+def _open_motors_without_moving(emio, port):
+    """
+    Open the motors in Extended Position Mode (multi-turn, > 180 deg) without moving them.
+
+    emio.motors.open() turns the torque on straight away, and a Dynamixel with torque on
+    drives to its stored Goal Position: whatever was last commanded while it stayed powered.
+    If the rod or spools moved since (torque off on disconnect, moved by hand), the motors
+    would jump back there. So: open the port, torque off, set the mode, set the goal to
+    where each motor is now, and only then turn the torque on.
+    """
+    motors = emio.motors
+    try:
+        mg = motors._mg
+        params = mg.parameters
+        mg.updateDeviceName(port)
+        mg.open()
+        mg.clearPort()
+        for dxl_id in params.DXL_IDs:
+            mg.packetHandler.write1ByteTxRx(mg.portHandler, dxl_id, params.ADDR_TORQUE_ENABLE, params.TORQUE_DISABLE)
+        mg.setOperatingMode(params.EXT_POSITION_MODE)
+        present = None
+        for _ in range(3):
+            present = mg.getCurrentPosition()
+            if present:
+                break
+            time.sleep(0.05)
+        if not present:
+            raise RuntimeError("could not read the motors' current positions")
+        mg.setGoalPosition(present)  # hold exactly where they are
+        mg.enableTorque()
+        try:
+            motors._device_index = EmioAPI.listEmioDevices().index(mg.deviceName)
+        except Exception:
+            pass
+        print("[INFO] Motors opened in Extended Position Mode (up to 360°) without moving them.")
+    except AttributeError as e:
+        # Different emioapi version: use its own open (the motors may move to their old goal).
+        print(f"[WARN] Safe open not available in this emioapi version ({e}); using emio.motors.open().")
+        if not motors.open(port):
+            raise RuntimeError(f"could not open the EMIO motors on port {port}")
+
+
 class CableDrivenRobotController:
     def __init__(self, min_angle=0.0, max_angle=math.radians(MAX_ANGLE_DEG), num_motors=4):
         """
@@ -152,25 +194,13 @@ class CableDrivenRobotController:
 
                 # Only the motors are needed here, so skip the camera.
                 emio = EmioAPI()
-                if not emio.motors.open(target_port):
-                    raise RuntimeError(f"could not open the EMIO motors on port {target_port}")
+                _open_motors_without_moving(emio, target_port)
                 self.emio = emio
                 self.port = target_port
 
-                # Enable Extended Position Mode (Mode 4) on all motors for multi-turn (> 180 deg) rotation
-                try:
-                    mg = emio.motors._mg
-                    params = mg.parameters
-                    for dxl_id in params.DXL_IDs:
-                        mg.packetHandler.write1ByteTxRx(mg.portHandler, dxl_id, params.ADDR_TORQUE_ENABLE, 0)
-                    mg.setOperatingMode(4)
-                    mg.enableTorque()
-                    print("[INFO] Extended Position Mode (Mode 4) enabled: motors can rotate past 180° up to 360°.")
-                except Exception as e:
-                    print(f"[WARN] Could not enable Extended Position Mode: {e}")
-
                 # Allow bus to settle after torque enable, then read initial positions with retry.
                 read_ok = False
+                last_error = "no positions returned"
                 for attempt in range(3):
                     try:
                         time.sleep(0.05)
@@ -183,12 +213,28 @@ class CableDrivenRobotController:
                             read_ok = True
                             break
                     except Exception as ex:
-                        if attempt < 2:
-                            time.sleep(0.05)
-                        else:
-                            print(f"[WARN] Could not read initial motor pulses ({ex}), defaulting to neutral 0.0 rad.")
+                        last_error = str(ex)
+                        time.sleep(0.05)
                 if not read_ok:
-                    self.current_angles = [0.0] * self.num_motors
+                    # Second source: the library's own position read.
+                    try:
+                        angles = [float(a) for a in emio.motors.angles]
+                        if len(angles) == self.num_motors:
+                            self.current_angles = angles
+                            read_ok = True
+                            print(f"[WARN] Raw pulse read failed ({last_error}); using emio.motors.angles instead.")
+                    except Exception as ex:
+                        last_error = str(ex)
+                if not read_ok:
+                    # Never assume 0: move_smooth would start from the wrong angles and the
+                    # motors would jump to the first target. Close the port and fall back to mock.
+                    try:
+                        emio.motors.close()
+                    except Exception:
+                        pass
+                    self.emio = None
+                    raise RuntimeError(f"could not read the motors' current positions ({last_error}); "
+                                       "not driving them blind. Check the cable and power, then reconnect")
 
                 self.is_connected = True
                 self.is_mock = False
@@ -217,6 +263,76 @@ class CableDrivenRobotController:
         # user must ask for it explicitly.
         if self.is_mock:
             self.home()
+
+    def release_torque(self):
+        """
+        Turn the motor torque off so the spools can be turned by hand. The motors do not
+        move by themselves while released; call hold_here() to take control again.
+        """
+        if self.is_mock or self.emio is None:
+            print("[ROBOT] (mock) torque released")
+            return
+        mg = self.emio.motors._mg
+        for dxl_id in mg.parameters.DXL_IDs:
+            mg.packetHandler.write1ByteTxRx(mg.portHandler, dxl_id, mg.parameters.ADDR_TORQUE_ENABLE,
+                                            mg.parameters.TORQUE_DISABLE)
+        print("[ROBOT] Torque released: the motors can be turned by hand.")
+
+    def hold_here(self):
+        """
+        Take control again where the motors are now, without moving them: set each goal to
+        the current position, turn the torque on, and update current_angles. Use it after
+        turning the motors by hand (their multi-turn count may have changed, so absolute
+        angles from before are no longer meaningful). Returns the angles in rad.
+        """
+        if self.is_mock or self.emio is None:
+            return list(self.current_angles)
+        mg = self.emio.motors._mg
+        present = None
+        for _ in range(3):
+            present = mg.getCurrentPosition()
+            if present:
+                break
+            time.sleep(0.05)
+        if not present:
+            raise RuntimeError("could not read the motors' current positions")
+        mg.setGoalPosition(present)
+        mg.enableTorque()
+        signed = [(p - 0x100000000 if p >= 0x80000000 else p) for p in present]
+        self.current_angles = [float(self.emio.motors.pulseToRad([p])[0]) for p in signed]
+        print("[ROBOT] Holding the current position: " +
+              ", ".join(f"M{i + 1}:{math.degrees(a):6.1f}°" for i, a in enumerate(self.current_angles)))
+        return list(self.current_angles)
+
+    def motor_status(self):
+        """Status lines per motor (mode, torque, position, temperature, voltage, current, hardware error),
+        read through the open connection. Returns [(motor name, [(text, is_error)])]."""
+        if self.is_mock or self.emio is None:
+            return [(f"M{i + 1}", [("mock mode: no hardware", False)]) for i in range(self.num_motors)]
+        mg = self.emio.motors._mg
+        out = []
+        for dxl_id in mg.parameters.DXL_IDs:
+            try:
+                out.append((f"M{dxl_id + 1}", _x_series_status(mg.packetHandler, mg.portHandler, dxl_id)))
+            except Exception as e:
+                out.append((f"M{dxl_id + 1}", [(f"no response ({e})", True)]))
+        return out
+
+    def clear_motor_errors(self):
+        """Reboot the motors that report a hardware error (their torque is off afterwards). Returns their names."""
+        if self.is_mock or self.emio is None:
+            return []
+        mg = self.emio.motors._mg
+        cleared = []
+        for dxl_id in mg.parameters.DXL_IDs:
+            err, comm, _ = mg.packetHandler.read1ByteTxRx(mg.portHandler, dxl_id, 70)
+            if comm == 0 and err:
+                mg.packetHandler.reboot(mg.portHandler, dxl_id)
+                cleared.append(f"M{dxl_id + 1}")
+        if cleared:
+            time.sleep(0.5)  # let them restart
+            print(f"[ROBOT] Cleared hardware errors on {', '.join(cleared)} (rebooted; torque off).")
+        return cleared
 
     def clamp_angles(self, angles):
         """Clamps angle commands to safe operating range [min_angle, max_angle]."""
@@ -427,30 +543,119 @@ def check_hardware(port=None):
 
     ph = PortHandler(target_port)
     pk = PacketHandler(params.PROTOCOL_VERSION)
-    if not ph.openPort():
-        print(f"[FAIL] Could not open {target_port} (is another program using it?).")
+    if not _open_port(ph, target_port):
         return
     try:
         ph.setBaudRate(params.BAUDRATE)
-        # Register map of the XM430-W210 (model 1030), as used by emioapi.
-        addr_torque, addr_present = 64, 132
+        found_errors = []
         for motor_id in params.DXL_IDs:
             model, comm, _ = pk.ping(ph, motor_id)
             if comm != 0:
-                print(f"[FAIL] Motor ID {motor_id}: no response ({pk.getTxRxResult(comm)})")
+                print(f"[FAIL] Motor ID {motor_id} (M{motor_id + 1}): no response ({pk.getTxRxResult(comm)})")
                 continue
-            line = f"[OK]   Motor ID {motor_id}: model {model}"
-            if model == 1030:
-                torque, _, _ = pk.read1ByteTxRx(ph, motor_id, addr_torque)
-                pulse, _, _ = pk.read4ByteTxRx(ph, motor_id, addr_present)
-                deg = (2048 - pulse) * 360.0 / 4096.0
-                line += f" | torque={'on' if torque else 'off'} | position={pulse} pulses = {deg:6.1f}° (0° = pulse 2048)"
-            else:
-                line += " | unexpected model, position not read"
-            print(line)
+            print(f"[OK]   Motor ID {motor_id} (M{motor_id + 1}): model {model}"
+                  + ("" if model in _X_SERIES_MODELS else " (not an X-series model: values below may be wrong)"))
+            for line, err in _x_series_status(pk, ph, motor_id):
+                print("       " + line)
+                if err:
+                    found_errors.append(motor_id)
+        if found_errors:
+            ids = ", ".join(f"M{i + 1}" for i in sorted(set(found_errors)))
+            print(f"[FAIL] Hardware error on {ids}: the motor switched its torque off to protect itself.")
+            print("       Fix the cause (see above), then clear it with:  python cabledriven.py --reboot")
     finally:
         ph.closePort()
     print("=== Nothing was moved. ===")
+
+
+def _open_port(ph, port):
+    try:
+        if ph.openPort():
+            return True
+    except Exception as e:
+        if "denied" in str(e).lower() or "busy" in str(e).lower():
+            print(f"[FAIL] {port} is in use by another program (a GUI still connected?). Close it, or use its "
+                  "'Motor status' button instead.")
+            return False
+        print(f"[FAIL] Could not open {port}: {e}")
+        return False
+    print(f"[FAIL] Could not open {port} (is another program using it?).")
+    return False
+
+
+# Dynamixel X-series (XM430-W210 etc.) control table, as used by emioapi
+_X_SERIES_MODELS = {1030, 1020, 1060, 1070, 1080, 1090, 1120, 1130, 1200, 1210, 1220, 1230}
+_HW_ERROR_BITS = {
+    0: "input voltage out of range (check the power supply)",
+    2: "overheating",
+    3: "motor encoder error",
+    4: "electrical shock / power cut",
+    5: "OVERLOAD: the motor stalled at its torque limit (cable pulled too tight?)",
+}
+_MODE_NAMES = {0: "current", 1: "velocity", 3: "position (one turn only)", 4: "extended position (multi-turn)",
+               5: "current-based position", 16: "PWM"}
+
+
+def _x_series_status(pk, ph, motor_id):
+    """Read-only status lines for one X-series motor: [(text, is_error)]."""
+    def r1(addr): return pk.read1ByteTxRx(ph, motor_id, addr)[0]
+    def r2(addr): return pk.read2ByteTxRx(ph, motor_id, addr)[0]
+    def r4(addr): return pk.read4ByteTxRx(ph, motor_id, addr)[0]
+    def signed(v, bits): return v - (1 << bits) if v >= 1 << (bits - 1) else v
+
+    out = []
+    mode = r1(11)
+    torque = r1(64)
+    pulse = signed(r4(132), 32)
+    out.append((f"mode: {_MODE_NAMES.get(mode, mode)} | torque {'on' if torque else 'off'} | "
+                f"position {pulse} pulses = {(2048 - pulse) * 360.0 / 4096.0:7.1f}°", False))
+    if mode == 3:
+        lo, hi = r4(52), r4(48)
+        out.append((f"WARNING: one-turn position mode, limited to pulses {lo}..{hi}: the motor stops at that angle. "
+                    "Connecting with cabledriven.py switches it to multi-turn.", False))
+    temp = r1(146)
+    volts = r2(144) / 10.0
+    current_ma = signed(r2(126), 16) * 2.69
+    limit_ma = r2(38) * 2.69
+    out.append((f"temperature {temp} °C | supply {volts:.1f} V | current {current_ma:6.0f} mA "
+                f"(limit {limit_ma:.0f} mA)", False))
+    err = r1(70)
+    if err:
+        names = [txt for bit, txt in _HW_ERROR_BITS.items() if err & (1 << bit)]
+        out.append(("HARDWARE ERROR: " + "; ".join(names or [f"code {err}"]), True))
+    else:
+        out.append(("no hardware error", False))
+    return out
+
+
+def reboot_motors(port=None):
+    """Reboot motors that report a hardware error, to clear it. Torque is off afterwards; nothing moves."""
+    from dynamixel_sdk import PortHandler, PacketHandler
+    from emioapi import _emiomotorsparameters as params
+    devices = EmioAPI.listEmioDevices() if HAS_EMIO_API else []
+    target_port = port or (devices[0] if devices else None)
+    if not target_port:
+        print("[FAIL] No EMIO motor board found.")
+        return
+    ph = PortHandler(target_port)
+    pk = PacketHandler(params.PROTOCOL_VERSION)
+    if not _open_port(ph, target_port):
+        return
+    try:
+        ph.setBaudRate(params.BAUDRATE)
+        for motor_id in params.DXL_IDs:
+            err, comm, _ = pk.read1ByteTxRx(ph, motor_id, 70)
+            if comm != 0:
+                print(f"[FAIL] M{motor_id + 1}: no response")
+            elif err:
+                pk.reboot(ph, motor_id)
+                print(f"[OK]   M{motor_id + 1}: hardware error {err} cleared by a reboot (torque is off)")
+            else:
+                print(f"[OK]   M{motor_id + 1}: no error, left alone")
+        time.sleep(0.5)
+    finally:
+        ph.closePort()
+    print("Reconnect, then in the slider GUI use 'Set zero here' (a reboot resets the multi-turn count).")
 
 
 def print_menu():
@@ -472,12 +677,17 @@ def main():
     parser = argparse.ArgumentParser(description="EMIO Cable-Driven Robot Controller")
     parser.add_argument("--port", type=str, default=None, help="Serial port to connect (e.g. COM12 or /dev/ttyUSB0)")
     parser.add_argument("--check", action="store_true", help="Run read-only hardware check")
+    parser.add_argument("--reboot", action="store_true",
+                        help="Clear motor hardware errors (overload etc.) by rebooting the motors that report one")
     parser.add_argument("--gui", "-g", action="store_true", help="Launch Graphical User Interface (GUI)")
     parser.add_argument("--camera", "-c", action="store_true", help="Launch RealSense Camera Viewer")
     args = parser.parse_args()
 
     if args.check:
         check_hardware(port=args.port)
+        return
+    if args.reboot:
+        reboot_motors(port=args.port)
         return
 
     if args.camera:
