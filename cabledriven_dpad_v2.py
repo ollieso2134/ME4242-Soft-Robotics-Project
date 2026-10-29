@@ -19,11 +19,11 @@ Features in v2:
 1. Hardware Port Selector & Reconnect:
    - Dynamic port scanning with COM port dropdown and Connect/Disconnect toggle.
    - Shows live connection status (Green = Connected, Amber = Simulation with error reason, Red = Disconnected).
-2. "Obstacle Co-Tension (Hold S-Bend)" mode (default: Enabled):
-   - Opposing buttons and cross-pad buttons remain active simultaneously.
-   - Opposing motor tension is preserved (no antagonistic relaxation subtraction).
-   - Motor angles clamped independently to [0.0, MAX_ANGLE_DEG].
-   - When unchecked, returns to free-air antagonistic relaxation mode.
+2. Same control logic as cabledriven_dpad.py: each active button contracts its motors
+   (+angle) and relaxes the opposite ones, pressing a button disengages its opposite and
+   every button on the other pad, and angles are clamped to 0..angle.
+   (The "Obstacle Co-Tension" mode was removed: holding the opposite motor made the
+   motors fight each other and overload.)
 3. Live Trajectory Recording:
    - "🔴 Record" / "⏹ Stop Rec" live jog recording sampled at 50 ms tick resolution
      with a ~100 ms minimum time delta to capture dynamic ramps and static anchor holds.
@@ -81,7 +81,7 @@ BUTTONS = {
 class ToggleDPad:
     def __init__(self, root, port=None):
         self.root = root
-        root.title("Cable-Driven Toggle D-Pad v2 (ME4242 Co-Tension & Trajectory Tool)")
+        root.title("Cable-Driven Toggle D-Pad v2 (ME4242 Trajectory Tool)")
 
         limit = math.radians(MAX_ANGLE_DEG)
         self.robot = CableDrivenRobotController(min_angle=0.0, max_angle=limit, num_motors=4)
@@ -147,16 +147,6 @@ class ToggleDPad:
         tk.Checkbutton(
             amp, text=f"Incremental ({INCREMENT_DEG:g}°)", variable=self.incremental_var, command=self.clear
         ).pack(side=tk.LEFT, padx=(8, 0))
-
-        # Obstacle Co-Tension (Hold S-Bend) toggle checkbutton
-        self.co_tension_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            amp,
-            text="Obstacle Co-Tension (Hold S-Bend)",
-            variable=self.co_tension_var,
-            font=("TkDefaultFont", 9, "bold"),
-            fg="#0284c7",
-        ).pack(side=tk.LEFT, padx=(12, 0))
 
         # D-pad grids: Pad 0 (Directional +) and Pad 1 (Motors X)
         pads = tk.Frame(root)
@@ -478,22 +468,17 @@ class ToggleDPad:
         if self.replay_state:
             return
         self.holding = False
-        co_tension = self.co_tension_var.get()
         if self.incremental_var.get():
             for m in BUTTONS[name][2]:
                 self.inc_targets[m] += INCREMENT_DEG
-                if not co_tension:
-                    self.inc_targets[(m + 2) % 4] -= INCREMENT_DEG
-            limit = MAX_ANGLE_DEG if co_tension else self.amplitude
-            self.inc_targets = [max(0.0, min(limit, v)) for v in self.inc_targets]
+                self.inc_targets[(m + 2) % 4] -= INCREMENT_DEG
+            self.inc_targets = [max(0.0, min(self.amplitude, v)) for v in self.inc_targets]
             return
-
         if name in self.active:
             self.active.discard(name)
         else:
-            if not co_tension:
-                self.active = {n for n in self.active if BUTTONS[n][4] == BUTTONS[name][4]}
-                self.active.discard(BUTTONS[name][3])
+            self.active = {n for n in self.active if BUTTONS[n][4] == BUTTONS[name][4]}
+            self.active.discard(BUTTONS[name][3])
             self.active.add(name)
         self.refresh()
 
@@ -520,19 +505,15 @@ class ToggleDPad:
             b.config(relief=tk.SUNKEN if name in self.active else tk.RAISED)
 
     def targets_deg(self):
-        co_tension = self.co_tension_var.get()
         if self.incremental_var.get():
-            limit = MAX_ANGLE_DEG if co_tension else self.amplitude
-            return [max(0.0, min(limit, v)) for v in self.inc_targets]
+            return [min(v, self.amplitude) for v in self.inc_targets]
         t = [0.0] * 4
         for name in self.active:
             motors = BUTTONS[name][2]
             for m in motors:
                 t[m] += self.amplitude
-                if not co_tension:
-                    t[(m + 2) % 4] -= self.amplitude
-        limit = MAX_ANGLE_DEG if co_tension else self.amplitude
-        return [max(0.0, min(limit, v)) for v in t]
+                t[(m + 2) % 4] -= self.amplitude
+        return [max(0.0, min(self.amplitude, v)) for v in t]
 
     def tick(self):
         if self.holding:
