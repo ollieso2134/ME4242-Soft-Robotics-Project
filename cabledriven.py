@@ -220,7 +220,7 @@ class CableDrivenRobotController:
                     try:
                         angles = [float(a) for a in emio.motors.angles]
                         if len(angles) == self.num_motors:
-                            self.current_angles = angles
+                            self.current_angles = _apply_direction(angles)
                             read_ok = True
                             print(f"[WARN] Raw pulse read failed ({last_error}); using emio.motors.angles instead.")
                     except Exception as ex:
@@ -299,7 +299,7 @@ class CableDrivenRobotController:
         mg.setGoalPosition(present)
         mg.enableTorque()
         signed = [(p - 0x100000000 if p >= 0x80000000 else p) for p in present]
-        self.current_angles = [float(self.emio.motors.pulseToRad([p])[0]) for p in signed]
+        self.current_angles = _apply_direction([float(self.emio.motors.pulseToRad([p])[0]) for p in signed])
         print("[ROBOT] Holding the current position: " +
               ", ".join(f"M{i + 1}:{math.degrees(a):6.1f}°" for i, a in enumerate(self.current_angles)))
         return list(self.current_angles)
