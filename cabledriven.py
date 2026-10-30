@@ -44,6 +44,32 @@ def _apply_direction(angles):
     return [-a if i in REVERSED_MOTORS else a for i, a in enumerate(angles)]
 
 
+# Slider recordings made before this have raw motor angles (REVERSED_MOTORS not applied yet).
+RAW_ANGLES_BEFORE = "2026-10-29 14:19"
+
+
+def trajectory_changes(data, now_deg=None):
+    """
+    A recorded trajectory as changes from its start pose, [(t, [deg x4])], + = cable pulled
+    in (the same direction as send_angles now), so it can be replayed from any pose:
+    - points with "delta" (cabledriven_sliders.py / cabledriven_dpad_v3.py from 30 Oct): as recorded.
+    - "start_angles_deg" but no "delta": changes from start_angles_deg. Recorded before
+      RAW_ANGLES_BEFORE, M2 / M4 are flipped so they move the way they did then.
+    - neither (D-pad files, absolute angles): changes from now_deg (default: the first point),
+      i.e. replayed as recorded when now_deg is the pose the robot is in.
+    """
+    traj = data["trajectory"] if isinstance(data, dict) else data
+    if "delta" in traj[0]:
+        return [(float(p["t"]), [float(d) for d in p["delta"][:4]]) for p in traj]
+    if isinstance(data, dict) and "start_angles_deg" in data:
+        base = data["start_angles_deg"]
+        raw = data.get("recorded_at", "") < RAW_ANGLES_BEFORE
+        fix = _apply_direction if raw else list
+        return [(float(p["t"]), fix([float(a) - b for a, b in zip(p["angles"][:4], base)])) for p in traj]
+    base = now_deg if now_deg is not None else [float(a) for a in traj[0]["angles"][:4]]
+    return [(float(p["t"]), [float(a) - b for a, b in zip(p["angles"][:4], base)]) for p in traj]
+
+
 def _open_motors_without_moving(emio, port):
     """
     Open the motors in Extended Position Mode (multi-turn, > 180 deg) without moving them.

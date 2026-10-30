@@ -19,18 +19,23 @@ Features in v2:
 1. Hardware Port Selector & Reconnect:
    - Dynamic port scanning with COM port dropdown and Connect/Disconnect toggle.
    - Shows live connection status (Green = Connected, Amber = Simulation with error reason, Red = Disconnected).
-2. Same control logic as cabledriven_dpad.py: each active button contracts its motors
-   (+angle) and relaxes the opposite ones, pressing a button disengages its opposite and
-   every button on the other pad, and angles are clamped to 0..angle.
-   (The "Obstacle Co-Tension" mode was removed: holding the opposite motor made the
-   motors fight each other and overload.)
+2. "Obstacle Co-Tension (Hold S-Bend)" mode (default: Enabled):
+   - Opposing buttons and cross-pad buttons remain active simultaneously.
+   - Opposing motor tension is preserved (no antagonistic relaxation subtraction).
+   - Motor angles clamped independently to [0.0, MAX_ANGLE_DEG].
+   - When unchecked, returns to free-air antagonistic relaxation mode.
+   All angles are measured from the pose the robot is in when it connects (0 deg = that
+   pose), so nothing jumps at start, whatever the motors read.
 3. Live Trajectory Recording:
    - "🔴 Record" / "⏹ Stop Rec" live jog recording sampled at 50 ms tick resolution
      with a ~100 ms minimum time delta to capture dynamic ramps and static anchor holds.
-   - "💾 Save" trajectory to JSON standard format with metadata.
+   - "💾 Save" trajectory to JSON standard format with metadata: "angles" (motor angles),
+     "delta" (change from start_angles_deg), same as cabledriven_sliders.py.
 4. Autonomous Replay:
    - Interpolated waypoint execution with speed selection (0.5x, 1.0x, 1.5x, 2.0x),
      looping, and backtrack (reverse trajectory for obstacle egress).
+   - Plays the recorded changes from the current pose, so it is repeatable from the same
+     starting pose (an old file without start_angles_deg is played at its recorded angles).
 """
 
 import json
@@ -40,11 +45,13 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from cabledriven import CableDrivenRobotController, MAX_ANGLE_DEG
+from cabledriven import CableDrivenRobotController, MAX_ANGLE_DEG, trajectory_changes
 
 SPEED_DEG_PER_S = 90.0
 TICK_MS = 50
 INCREMENT_DEG = 10.0
+TRIM_DEG = 5.0           # per-motor - / + step (hold the button to repeat)
+REL_MIN_DEG = -180.0     # how far - can let a cable out below zero
 CANVAS_SIZE = 200
 R_OUTER = 80
 R_INNER = 15
@@ -81,15 +88,18 @@ BUTTONS = {
 class ToggleDPad:
     def __init__(self, root, port=None):
         self.root = root
-        root.title("Cable-Driven Toggle D-Pad v2 (ME4242 Trajectory Tool)")
+        root.title("Cable-Driven Toggle D-Pad v2 (ME4242 Co-Tension & Trajectory Tool)")
 
-        limit = math.radians(MAX_ANGLE_DEG)
-        self.robot = CableDrivenRobotController(min_angle=0.0, max_angle=limit, num_motors=4)
+        # Wide limits: the D-pad keeps the motors within 0..angle of the starting pose.
+        limit = 2 * math.radians(MAX_ANGLE_DEG)
+        self.robot = CableDrivenRobotController(min_angle=-limit, max_angle=limit, num_motors=4)
 
         # Port scanning
         self.available_ports = self.scan_ports()
         default_port = port or (self.available_ports[0] if self.available_ports else None)
 
+        # Angles are relative to this pose (motor angle = start + relative), set on connect
+        self.start = [0.0] * 4
         self.angles = [0.0] * 4
         # After connecting, hold the motors where they are (send nothing) until the user
         # presses a D-pad button, Relax or Replay. Otherwise the tick loop would drive
@@ -98,6 +108,7 @@ class ToggleDPad:
         self.amplitude = 90.0
         self.active = set()
         self.inc_targets = [0.0] * 4
+        self.trim = [0.0] * 4    # per-motor - / + adjustment, added to the D-pad targets
         self.buttons = {}
         self.trajectory = []
         self.play_traj = []
@@ -148,6 +159,16 @@ class ToggleDPad:
             amp, text=f"Incremental ({INCREMENT_DEG:g}°)", variable=self.incremental_var, command=self.clear
         ).pack(side=tk.LEFT, padx=(8, 0))
 
+        # Obstacle Co-Tension (Hold S-Bend) toggle checkbutton
+        self.co_tension_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            amp,
+            text="Obstacle Co-Tension (Hold S-Bend)",
+            variable=self.co_tension_var,
+            font=("TkDefaultFont", 9, "bold"),
+            fg="#0284c7",
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
         # D-pad grids: Pad 0 (Directional +) and Pad 1 (Motors X)
         pads = tk.Frame(root)
         pads.pack(padx=10, pady=10)
@@ -182,6 +203,24 @@ class ToggleDPad:
             )
             b.grid(row=r, column=c)
             self.buttons[name] = b
+
+        # Per-motor - / +: pull in or let out one motor by TRIM_DEG (hold to repeat), on top of the D-pad
+        trim_bar = tk.Frame(root)
+        trim_bar.pack(pady=(0, 6))
+        for i, color in enumerate(motor_colors.values()):
+            tk.Label(trim_bar, text=f"M{i + 1}", fg=color, font=("TkDefaultFont", 9, "bold")).pack(side=tk.LEFT, padx=(8, 2))
+            for text, d in (("−", -1), ("+", +1)):
+                tk.Button(trim_bar, text=text, width=3, repeatdelay=300, repeatinterval=100,
+                          command=lambda i=i, d=d: self.adjust(i, d)).pack(side=tk.LEFT)
+
+        # Zero: release the motors to adjust the spools by hand, then take control there as the new 0
+        zero_bar = tk.Frame(root)
+        zero_bar.pack(pady=(0, 2))
+        self.released = False
+        self.release_btn = tk.Button(zero_bar, text="Release motors (adjust by hand)", width=28,
+                                     command=self.toggle_release)
+        self.release_btn.pack(side=tk.LEFT, padx=3)
+        tk.Button(zero_bar, text="Set zero here", width=14, command=self.set_zero_here).pack(side=tk.LEFT, padx=3)
 
         # Trajectory Replay & Recording Bar
         rep = tk.Frame(root)
@@ -258,13 +297,11 @@ class ToggleDPad:
             except Exception:
                 pass
         self.robot.connect(port=port)
+        # 0 deg on the D-pad = the pose the robot is in now
+        self.start = [math.degrees(a) for a in self.robot.current_angles]
+        self.angles = [0.0] * 4
         if self.robot.is_connected and not self.robot.is_mock:
-            self.angles = [math.degrees(a) for a in self.robot.current_angles]
             self.holding = True
-            outside = [f"M{i + 1} {a:.1f} deg" for i, a in enumerate(self.angles) if a < 0.0 or a > MAX_ANGLE_DEG]
-            if outside:
-                print(f"[WARN] Outside 0-{MAX_ANGLE_DEG:g} deg: {', '.join(outside)}. "
-                      "These motors will jump into range when you first move them; check the cables first.")
             actual_port = getattr(self.robot, "port", None) or port
             if actual_port:
                 if actual_port not in self.available_ports:
@@ -312,15 +349,20 @@ class ToggleDPad:
         c.create_oval(tip_x - 6, tip_y - 6, tip_x + 6, tip_y + 6, fill="#f72585", outline="white")
         c.create_oval(cx - R_INNER, cy - R_INNER, cx + R_INNER, cy + R_INNER, outline="#555", width=1.5)
 
+    def _point(self, t, rel):
+        """A recorded point: motor angles, and "delta" = change from start_angles_deg."""
+        return {"t": t, "angles": [round(s + a, 2) for s, a in zip(self.start, rel)], "delta": list(rel)}
+
     def toggle_record(self):
-        if self.replay_state:
+        if self.replay_state or self.released:
             return
         if not self.recording:
             self.recording = True
             self.record_t0 = time.perf_counter()
             self.last_record_time = 0.0
             cur_angles = [round(a, 2) for a in self.angles]
-            self.recorded_points = [{"t": 0.0, "angles": cur_angles}]
+            self.record_start = list(self.start)
+            self.recorded_points = [self._point(0.0, cur_angles)]
             self.last_recorded_angles = list(cur_angles)
             self.record_btn.config(text="⏹ Stop Rec", relief=tk.SUNKEN)
             self.save_btn.config(state=tk.DISABLED)
@@ -331,8 +373,8 @@ class ToggleDPad:
             self.recording = False
             elapsed = round(time.perf_counter() - self.record_t0, 3)
             cur_angles = [round(a, 2) for a in self.angles]
-            if not self.recorded_points or self.recorded_points[-1]["angles"] != cur_angles or elapsed > self.recorded_points[-1]["t"]:
-                self.recorded_points.append({"t": elapsed, "angles": cur_angles})
+            if not self.recorded_points or self.recorded_points[-1]["delta"] != cur_angles or elapsed > self.recorded_points[-1]["t"]:
+                self.recorded_points.append(self._point(elapsed, cur_angles))
             self.record_btn.config(text="🔴 Record", relief=tk.RAISED)
             self.save_btn.config(state=tk.NORMAL if self.recorded_points else tk.DISABLED)
             self.load_btn.config(state=tk.NORMAL)
@@ -367,6 +409,7 @@ class ToggleDPad:
             "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "duration_s": total_time,
             "num_points": len(self.recorded_points),
+            "start_angles_deg": [round(a, 2) for a in self.record_start],
             "trajectory": self.recorded_points,
         }
         try:
@@ -377,7 +420,7 @@ class ToggleDPad:
             return
 
         # Automatically make available for immediate replay
-        self.trajectory = [(float(p["t"]), [float(a) for a in p["angles"][:4]]) for p in self.recorded_points]
+        self.trajectory = trajectory_changes(self.recorded_points)
         self.traj_label.config(
             text=f"Saved & Loaded: {fname} ({len(self.trajectory)} pts, {total_time:.1f}s)"
         )
@@ -399,7 +442,8 @@ class ToggleDPad:
             traj = data["trajectory"] if isinstance(data, dict) else data
             if not traj:
                 raise ValueError("empty trajectory")
-            self.trajectory = [(float(p["t"]), [float(a) for a in p["angles"][:4]]) for p in traj]
+            # Recorded changes, played from the current pose (an old file: at its recorded angles)
+            self.trajectory = trajectory_changes(data, self.start)
         except Exception as e:
             messagebox.showerror("Error", f"Could not load trajectory: {e}")
             return
@@ -409,7 +453,7 @@ class ToggleDPad:
         self.replay_btn.config(state=tk.NORMAL)
 
     def start_replay(self):
-        if not self.trajectory or self.replay_state or self.recording:
+        if not self.trajectory or self.replay_state or self.recording or self.released:
             return
         self.holding = False
         self.active.clear()
@@ -465,22 +509,35 @@ class ToggleDPad:
         return traj[-1][1], None
 
     def press(self, name):
-        if self.replay_state:
+        if self.replay_state or self.released:
             return
         self.holding = False
+        co_tension = self.co_tension_var.get()
         if self.incremental_var.get():
             for m in BUTTONS[name][2]:
                 self.inc_targets[m] += INCREMENT_DEG
-                self.inc_targets[(m + 2) % 4] -= INCREMENT_DEG
-            self.inc_targets = [max(0.0, min(self.amplitude, v)) for v in self.inc_targets]
+                if not co_tension:
+                    self.inc_targets[(m + 2) % 4] -= INCREMENT_DEG
+            limit = MAX_ANGLE_DEG if co_tension else self.amplitude
+            self.inc_targets = [max(0.0, min(limit, v)) for v in self.inc_targets]
             return
+
         if name in self.active:
             self.active.discard(name)
         else:
-            self.active = {n for n in self.active if BUTTONS[n][4] == BUTTONS[name][4]}
-            self.active.discard(BUTTONS[name][3])
+            if not co_tension:
+                self.active = {n for n in self.active if BUTTONS[n][4] == BUTTONS[name][4]}
+                self.active.discard(BUTTONS[name][3])
             self.active.add(name)
         self.refresh()
+
+    def adjust(self, i, d):
+        """- / + button: let out (-) or pull in (+) motor i by TRIM_DEG."""
+        if self.replay_state or self.released:
+            return
+        self.holding = False
+        b = self._button_targets()[i]  # keep the motor itself within REL_MIN_DEG..MAX_ANGLE_DEG
+        self.trim[i] = max(REL_MIN_DEG - b, min(MAX_ANGLE_DEG - b, self.trim[i] + d * TRIM_DEG))
 
     def apply_amplitude(self):
         try:
@@ -492,12 +549,45 @@ class ToggleDPad:
 
     def relax(self):
         """Relax button: release the hold-on-connect and relax all motors."""
+        if self.released:
+            return
         self.holding = False
         self.clear()
+
+    def toggle_release(self):
+        """Torque off so the spools can be turned by hand; press again (or Set zero here) to take control."""
+        if self.recording or self.replay_state:
+            return
+        if not self.released:
+            self.robot.release_torque()
+            self.released = True
+            self.holding = True
+            self.release_btn.config(text="Released: press Set zero here", fg="#dc2626")
+        else:
+            self.set_zero_here()
+
+    def set_zero_here(self):
+        """Hold the motors where they are now (no jump) and make this pose the new 0."""
+        if self.recording:
+            return
+        self.end_replay("Replay stopped: new zero set")
+        try:
+            self.robot.hold_here()
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not take control of the motors: {e}")
+            return
+        self.start = [math.degrees(a) for a in self.robot.current_angles]
+        self.angles = [0.0] * 4
+        self.clear()
+        self.released = False
+        self.holding = True
+        self.release_btn.config(text="Release motors (adjust by hand)", fg="black")
+        print("[INFO] New zero set here: " + ", ".join(f"M{i + 1} {a:.1f}" for i, a in enumerate(self.start)))
 
     def clear(self):
         self.active.clear()
         self.inc_targets = [0.0] * 4
+        self.trim = [0.0] * 4
         self.refresh()
 
     def refresh(self):
@@ -505,19 +595,28 @@ class ToggleDPad:
             b.config(relief=tk.SUNKEN if name in self.active else tk.RAISED)
 
     def targets_deg(self):
+        """D-pad targets plus the per-motor - / + adjustment."""
+        return [max(REL_MIN_DEG, min(MAX_ANGLE_DEG, b + t)) for b, t in zip(self._button_targets(), self.trim)]
+
+    def _button_targets(self):
+        co_tension = self.co_tension_var.get()
         if self.incremental_var.get():
-            return [min(v, self.amplitude) for v in self.inc_targets]
+            limit = MAX_ANGLE_DEG if co_tension else self.amplitude
+            return [max(0.0, min(limit, v)) for v in self.inc_targets]
         t = [0.0] * 4
         for name in self.active:
             motors = BUTTONS[name][2]
             for m in motors:
                 t[m] += self.amplitude
-                t[(m + 2) % 4] -= self.amplitude
-        return [max(0.0, min(self.amplitude, v)) for v in t]
+                if not co_tension:
+                    t[(m + 2) % 4] -= self.amplitude
+        limit = MAX_ANGLE_DEG if co_tension else self.amplitude
+        return [max(0.0, min(limit, v)) for v in t]
 
     def tick(self):
         if self.holding:
-            self.readout.config(text="Holding the motors where they are. Press a D-pad button, Relax or Replay to move.")
+            self.readout.config(text="Released: turn the spools by hand, then press Set zero here." if self.released else
+                                "Holding the motors where they are. Press a D-pad button, Relax or Replay to move.")
             self.draw()
             self.root.after(TICK_MS, self.tick)
             return
@@ -550,22 +649,22 @@ class ToggleDPad:
                 if time_delta >= 0.10:
                     # If previously holding stationary for >250 ms, lock the hold waypoint before motion
                     if self.last_recorded_angles is not None and time_delta > 0.25:
-                        self.recorded_points.append({
-                            "t": round(elapsed - TICK_MS / 1000.0, 3),
-                            "angles": list(self.last_recorded_angles),
-                        })
-                    self.recorded_points.append({"t": elapsed, "angles": list(cur_angles)})
+                        self.recorded_points.append(
+                            self._point(round(elapsed - TICK_MS / 1000.0, 3), list(self.last_recorded_angles))
+                        )
+                    self.recorded_points.append(self._point(elapsed, list(cur_angles)))
                     self.last_recorded_angles = list(cur_angles)
                     self.last_record_time = elapsed
                     self.traj_label.config(text=f"🔴 Recording: {elapsed:.1f}s ({len(self.recorded_points)} pts)")
             elif time_delta >= 1.0:
-                self.recorded_points.append({"t": elapsed, "angles": list(cur_angles)})
+                self.recorded_points.append(self._point(elapsed, list(cur_angles)))
                 self.last_recorded_angles = list(cur_angles)
                 self.last_record_time = elapsed
                 self.traj_label.config(text=f"🔴 Recording: {elapsed:.1f}s ({len(self.recorded_points)} pts)")
 
-        self.robot.send_angles([math.radians(a) for a in self.angles])
-        self.readout.config(text="  ".join(f"M{i + 1}: {a:6.1f}°" for i, a in enumerate(self.angles)))
+        self.robot.send_angles([math.radians(s + a) for s, a in zip(self.start, self.angles)])
+        self.readout.config(text="  ".join(f"M{i + 1}: {a:6.1f}°" for i, a in enumerate(self.angles))
+                            + "  from start   (motor: " + "  ".join(f"{s + a:.0f}" for s, a in zip(self.start, self.angles)) + ")")
         self.draw()
         self.root.after(TICK_MS, self.tick)
 

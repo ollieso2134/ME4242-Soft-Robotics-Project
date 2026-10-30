@@ -17,10 +17,11 @@ Simple slider GUI for the EMIO cable-driven robot, made for recording trajectori
   multi-turn count then, so their absolute angles cannot be trusted.
 - Record / Stop / Save: records what the motors do (including pauses, which become
   checkpoints for camera_feedback.py) and saves to trajectories/*.json in the same
-  format as cabledriven_dpad_v2.py: "angles" are the real motor angles, and
-  "start_angles_deg" is the pose the recording started from.
-- Load / Replay: plays a saved trajectory relative to the pose the robot starts in now
-  (a file without start_angles_deg, e.g. from the D-pad, is played as recorded).
+  format as cabledriven_dpad_v2.py: "angles" are the motor angles, plus "delta", the
+  change from the start pose ("start_angles_deg"), + = cable pulled in.
+- Load / Replay: plays the changes from the pose the robot is in now (zero), so it is
+  repeatable from the same starting pose (see cabledriven.trajectory_changes; a D-pad
+  file without start_angles_deg is played as recorded).
 
 Run:  python cabledriven_sliders.py            (finds the board automatically)
       python cabledriven_sliders.py --port COM3
@@ -33,7 +34,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from cabledriven import CableDrivenRobotController, MAX_ANGLE_DEG
+from cabledriven import CableDrivenRobotController, MAX_ANGLE_DEG, trajectory_changes
 
 SPEED_DEG_PER_S = 60.0   # how fast the motors follow the sliders
 TICK_MS = 50
@@ -241,9 +242,8 @@ class SliderRecorder:
     def _absolute(self, rel):
         return [round(s + a, 2) for s, a in zip(self.start, rel)]
 
-    @staticmethod
-    def _relative(angles, base):
-        return [float(a) - b for a, b in zip(angles, base)]
+    def _point(self, t, rel):
+        return {"t": t, "angles": self._absolute(rel), "delta": [round(a, 2) for a in rel]}
 
     # -- recording ------------------------------------------------------------
     def toggle_record(self):
@@ -252,7 +252,7 @@ class SliderRecorder:
         if not self.recording:
             self.recording = True
             self.rec_t0 = time.perf_counter()
-            self.points = [{"t": 0.0, "angles": self._absolute(self.angles)}]
+            self.points = [self._point(0.0, self.angles)]
             self.last_change = 0.0
             self.rec_btn.config(text="■ Stop")
             self.save_btn.config(state=tk.DISABLED)
@@ -260,21 +260,20 @@ class SliderRecorder:
             self.recording = False
             t = round(time.perf_counter() - self.rec_t0, 3)
             if t > self.points[-1]["t"]:
-                self.points.append({"t": t, "angles": self._absolute(self.angles)})
+                self.points.append(self._point(t, self.angles))
             self.rec_btn.config(text="● Record")
             self.save_btn.config(state=tk.NORMAL)
-            self.trajectory = [(p["t"], self._relative(p["angles"], self.start)) for p in self.points]
+            self.trajectory = trajectory_changes(self.points)
             self.play_btn.config(state=tk.NORMAL)
 
     def _record_tick(self):
         t = round(time.perf_counter() - self.rec_t0, 3)
-        cur = self._absolute(self.angles)
         last = self.points[-1]
-        if any(abs(c - p) >= 0.05 for c, p in zip(cur, last["angles"])):
+        if any(abs(c - p) >= 0.05 for c, p in zip(self.angles, last["delta"])):
             # keep the end of a pause, so replay waits there too
             if t - self.last_change > HOLD_S and t - last["t"] > HOLD_S:
-                self.points.append({"t": round(t - TICK_MS / 1000.0, 3), "angles": list(last["angles"])})
-            self.points.append({"t": t, "angles": cur})
+                self.points.append(dict(last, t=round(t - TICK_MS / 1000.0, 3)))
+            self.points.append(self._point(t, self.angles))
             self.last_change = t
 
     def save(self):
@@ -304,10 +303,8 @@ class SliderRecorder:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            traj = data["trajectory"] if isinstance(data, dict) else data
-            # Relative to the recording's start pose if it has one, else to ours (= play as recorded)
-            base = data.get("start_angles_deg", self.start) if isinstance(data, dict) else self.start
-            self.trajectory = [(float(p["t"]), self._relative(p["angles"][:4], base)) for p in traj]
+            # Changes from the recording's start pose, played from our zero (a D-pad file: as recorded)
+            self.trajectory = trajectory_changes(data, self.start)
         except Exception as e:
             messagebox.showerror("Error", f"Could not load trajectory: {e}")
             return
