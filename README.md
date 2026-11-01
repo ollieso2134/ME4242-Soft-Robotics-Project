@@ -88,7 +88,17 @@ python simulation/simulate_obstacle_retrieval.py
   - `[H]`: Home arm and reset arena letters.
   - `[Q]`: Quit simulator.
 
-### 3. Run Automated Benchmark Test
+### 4. SOFA Physics Simulation of the Cable-Driven Rod
+```powershell
+sofa_sim\run_sim.bat           # sliders in the "Cable rod: motors" window (press Play first)
+sofa_sim\run_sim.bat bend      # pull each cable in turn
+sofa_sim\run_sim.bat circle    # circular sweep
+```
+- Uses the SOFA bundled with Emio Labs (Windows). The rod is a BeamAdapter beam clamped at the top mount; 4 SoftRobots cables run through the spacer disks, cable pull = 12 mm spool radius x motor angle.
+- The console prints the simulated tip position next to the PCC prediction from `cartesian_controller.py`, plus each cable's tension.
+- Rig dimensions and the rod material are constants at the top of `sofa_sim/cable_rod_scene.py`. The rod material is a spring-steel guess and should be tuned against the real rod.
+
+### 5. Run Automated Benchmark Test
 ```powershell
 python simulation/test_obstacle_retrieval.py
 ```
