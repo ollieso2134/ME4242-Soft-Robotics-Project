@@ -44,8 +44,6 @@ def _apply_direction(angles):
     return [-a if i in REVERSED_MOTORS else a for i, a in enumerate(angles)]
 
 
-<<<<<<< HEAD
-=======
 # Slider recordings made before this have raw motor angles (REVERSED_MOTORS not applied yet).
 RAW_ANGLES_BEFORE = "2026-10-29 14:19"
 
@@ -72,7 +70,6 @@ def trajectory_changes(data, now_deg=None):
     return [(float(p["t"]), [float(a) - b for a, b in zip(p["angles"][:4], base)]) for p in traj]
 
 
->>>>>>> 1c5eda31294a5d530c15be8520c14df8b269cb08
 def _open_motors_without_moving(emio, port):
     """
     Open the motors in Extended Position Mode (multi-turn, > 180 deg) without moving them.

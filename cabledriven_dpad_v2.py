@@ -19,21 +19,13 @@ Features in v2:
 1. Hardware Port Selector & Reconnect:
    - Dynamic port scanning with COM port dropdown and Connect/Disconnect toggle.
    - Shows live connection status (Green = Connected, Amber = Simulation with error reason, Red = Disconnected).
-<<<<<<< HEAD
 2. Same control logic as cabledriven_dpad.py: each active button contracts its motors
    (+angle) and relaxes the opposite ones, pressing a button disengages its opposite and
    every button on the other pad, and angles are clamped to 0..angle.
    (The "Obstacle Co-Tension" mode was removed: holding the opposite motor made the
    motors fight each other and overload.)
-=======
-2. "Obstacle Co-Tension (Hold S-Bend)" mode (default: Enabled):
-   - Opposing buttons and cross-pad buttons remain active simultaneously.
-   - Opposing motor tension is preserved (no antagonistic relaxation subtraction).
-   - Motor angles clamped independently to [0.0, MAX_ANGLE_DEG].
-   - When unchecked, returns to free-air antagonistic relaxation mode.
    All angles are measured from the pose the robot is in when it connects (0 deg = that
    pose), so nothing jumps at start, whatever the motors read.
->>>>>>> 1c5eda31294a5d530c15be8520c14df8b269cb08
 3. Live Trajectory Recording:
    - "🔴 Record" / "⏹ Stop Rec" live jog recording sampled at 50 ms tick resolution
      with a ~100 ms minimum time delta to capture dynamic ramps and static anchor holds.
@@ -299,16 +291,7 @@ class ToggleDPad:
         self.start = [math.degrees(a) for a in self.robot.current_angles]
         self.angles = [0.0] * 4
         if self.robot.is_connected and not self.robot.is_mock:
-<<<<<<< HEAD
-            self.angles = [math.degrees(a) for a in self.robot.current_angles]
             self.holding = True
-            outside = [f"M{i + 1} {a:.1f} deg" for i, a in enumerate(self.angles) if a < 0.0 or a > MAX_ANGLE_DEG]
-            if outside:
-                print(f"[WARN] Outside 0-{MAX_ANGLE_DEG:g} deg: {', '.join(outside)}. "
-                      "These motors will jump into range when you first move them; check the cables first.")
-=======
-            self.holding = True
->>>>>>> 1c5eda31294a5d530c15be8520c14df8b269cb08
             actual_port = getattr(self.robot, "port", None) or port
             if actual_port:
                 if actual_port not in self.available_ports:
@@ -519,10 +502,6 @@ class ToggleDPad:
         if self.replay_state or self.released:
             return
         self.holding = False
-<<<<<<< HEAD
-=======
-        co_tension = self.co_tension_var.get()
->>>>>>> 1c5eda31294a5d530c15be8520c14df8b269cb08
         if self.incremental_var.get():
             for m in BUTTONS[name][2]:
                 self.inc_targets[m] += INCREMENT_DEG
@@ -555,11 +534,6 @@ class ToggleDPad:
 
     def relax(self):
         """Relax button: release the hold-on-connect and relax all motors."""
-<<<<<<< HEAD
-        self.holding = False
-        self.clear()
-
-=======
         if self.released:
             return
         self.holding = False
@@ -595,7 +569,6 @@ class ToggleDPad:
         self.release_btn.config(text="Release motors (adjust by hand)", fg="black")
         print("[INFO] New zero set here: " + ", ".join(f"M{i + 1} {a:.1f}" for i, a in enumerate(self.start)))
 
->>>>>>> 1c5eda31294a5d530c15be8520c14df8b269cb08
     def clear(self):
         self.active.clear()
         self.inc_targets = [0.0] * 4
@@ -607,14 +580,10 @@ class ToggleDPad:
             b.config(relief=tk.SUNKEN if name in self.active else tk.RAISED)
 
     def targets_deg(self):
-<<<<<<< HEAD
-=======
         """D-pad targets plus the per-motor - / + adjustment."""
         return [max(REL_MIN_DEG, min(MAX_ANGLE_DEG, b + t)) for b, t in zip(self._button_targets(), self.trim)]
 
     def _button_targets(self):
-        co_tension = self.co_tension_var.get()
->>>>>>> 1c5eda31294a5d530c15be8520c14df8b269cb08
         if self.incremental_var.get():
             return [min(v, self.amplitude) for v in self.inc_targets]
         t = [0.0] * 4
@@ -627,12 +596,8 @@ class ToggleDPad:
 
     def tick(self):
         if self.holding:
-<<<<<<< HEAD
-            self.readout.config(text="Holding the motors where they are. Press a D-pad button, Relax or Replay to move.")
-=======
             self.readout.config(text="Released: turn the spools by hand, then press Set zero here." if self.released else
                                 "Holding the motors where they are. Press a D-pad button, Relax or Replay to move.")
->>>>>>> 1c5eda31294a5d530c15be8520c14df8b269cb08
             self.draw()
             self.root.after(TICK_MS, self.tick)
             return

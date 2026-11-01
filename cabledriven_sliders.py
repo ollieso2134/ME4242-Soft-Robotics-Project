@@ -73,7 +73,7 @@ class SliderRecorder:
                  font=("Segoe UI", 9)).pack()
 
         self.scales = []
-        self._ignore_slide = False
+        self._pending_set = [None] * 4  # value set by code whose slider callback has not fired yet
         for i in range(4):
             row = tk.Frame(root)
             row.pack(fill="x", padx=10, pady=2)
@@ -127,7 +127,10 @@ class SliderRecorder:
 
     # -- input --------------------------------------------------------------
     def on_slide(self, i, value):
-        if self._ignore_slide or self.replay:
+        pending, self._pending_set[i] = self._pending_set[i], None
+        if pending is not None and float(value) == pending:  # our own _set_scale, not the user
+            return
+        if self.replay:
             return
         if self.released:  # motors are being turned by hand: ignore the sliders
             self._set_scale(i, self.targets[i])
@@ -162,9 +165,13 @@ class SliderRecorder:
         self.holding = False
 
     def _set_scale(self, i, value):
-        self._ignore_slide = True
-        self.scales[i].set(value)
-        self._ignore_slide = False
+        # Tk calls the slider command later (when idle), not inside set(), so a flag around
+        # set() cannot filter it: remember the value instead and skip it in on_slide.
+        sc = self.scales[i]
+        before = sc.get()
+        sc.set(value)
+        if sc.get() != before:
+            self._pending_set[i] = float(sc.get())
 
     def toggle_release(self):
         """Torque off so the spools can be turned by hand; press again (or Set zero here) to take control."""
@@ -307,7 +314,10 @@ class SliderRecorder:
             traj = data["trajectory"] if isinstance(data, dict) else data
             # Relative to the recording's start pose if it has one, else to ours (= play as recorded)
             base = data.get("start_angles_deg", self.start) if isinstance(data, dict) else self.start
-            self.trajectory = [(float(p["t"]), self._relative(p["angles"][:4], base)) for p in traj]
+            # Keep replay within the slider range, like manual moves
+            self.trajectory = [(float(p["t"]), [min(max(a, REL_MIN_DEG), MAX_ANGLE_DEG)
+                                                for a in self._relative(p["angles"][:4], base)])
+                               for p in traj]
         except Exception as e:
             messagebox.showerror("Error", f"Could not load trajectory: {e}")
             return
