@@ -11,6 +11,7 @@ so the motors can follow them. A pause at the start of a file is dropped.
 
     --hold 0.8       pause kept after each move (default 0.5 s)
     --fast-reset 2   play the moves back to zero (the start pose) 2x faster
+    --short 0.1      also cut the short gaps between key presses mid-motion to 0.1 s
 
 Several files with -o join them in that order into one trajectory. If a file does not
 start where the previous one ended, a move at the slider speed bridges the gap:
@@ -45,9 +46,11 @@ def _runs(changes):
     return runs
 
 
-def optimize(changes, hold=HOLD_S, fast_reset=1.0):
+def optimize(changes, hold=HOLD_S, fast_reset=1.0, short=None):
     """[(t, delta)] with every pause cut to `hold` s (a leading pause dropped) and, with
-    fast_reset > 1, the moves that end back at zero played that much faster."""
+    fast_reset > 1, the moves that end back at zero played that much faster. With `short`,
+    pauses already shorter than `hold` (gaps between key presses in the middle of a motion)
+    are cut to `short` s."""
     t, pose = 0.0, changes[0][1]
     out = [(0.0, pose)]
     for i, (kind, steps) in enumerate(_runs(changes)):
@@ -55,7 +58,8 @@ def optimize(changes, hold=HOLD_S, fast_reset=1.0):
         if kind == "hold":
             if i == 0 or total <= 0:
                 continue
-            scale = min(1.0, hold / total)
+            limit = short if short is not None and total < hold else hold
+            scale = min(1.0, limit / total)
         else:
             to_zero = fast_reset > 1 and _same(steps[-1][1], [0.0] * 4) and not _same(pose, [0.0] * 4)
             scale = 1.0 / fast_reset if to_zero else 1.0
@@ -93,12 +97,14 @@ def main():
                    help="output file; with several input files they are joined into it in order")
     p.add_argument("--hold", type=float, default=HOLD_S, help=f"pause kept after each move (default {HOLD_S} s)")
     p.add_argument("--fast-reset", type=float, default=1.0, help="speed-up of the moves back to zero (default 1)")
+    p.add_argument("--short", type=float, default=None,
+                   help="cut pauses shorter than --hold (gaps between key presses mid-motion) to this many s")
     args = p.parse_args()
     if len(args.files) > 1 and not args.out:
         p.error("joining several files needs -o OUT")
 
     datas = [_load(f) for f in args.files]
-    parts = [optimize(trajectory_changes(d), args.hold, args.fast_reset) for d in datas]
+    parts = [optimize(trajectory_changes(d), args.hold, args.fast_reset, args.short) for d in datas]
     points = join(parts, args.hold)
     out = args.out or os.path.splitext(args.files[0])[0] + "_opt.json"
     base = datas[0].get("start_angles_deg") if isinstance(datas[0], dict) else None
